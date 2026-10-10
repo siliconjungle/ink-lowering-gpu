@@ -32,3 +32,5 @@ measurements include transfer and host costs; unavailable or unsupported GPU
 execution replays on the separately versioned compiled C backend.
 Portable f32 follows WGSL evaluation rules; CPU/GPU bit identity is not promised.
 See ink-lang/docs/gpu-compute.md for the versioned ABI, limits and evidence.
+
+`gpu::emit_selected` emits the exact module accepted by the shared semantic selection checker. GPU capability and measured profitability remain separate from proof validity. The legacy mixed-route executor rejects compute-v2 transport rather than emitting an incompatible host ABI.

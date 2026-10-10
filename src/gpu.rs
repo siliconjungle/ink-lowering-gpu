@@ -254,6 +254,12 @@ fn put(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> LangResult<()> {
 
 /// Emit browser and standalone native host code with the same WGSL primitives.
 /// The native project links generated C for CPU fallback, never an interpreter.
+pub fn emit_selected(
+    selected: &ink_core::optimisation::CheckedSelection,
+    dir: &Path,
+) -> LangResult<()> {
+    emit(selected.module().pure_program()?, dir)
+}
 pub fn emit(p: &Program, dir: &Path) -> LangResult<()> {
     if crate::compute::needed(p) {
         return crate::compute::emit_bundle(p, dir);
@@ -263,6 +269,9 @@ pub fn emit(p: &Program, dir: &Path) -> LangResult<()> {
 
 /// Placement of literal checked source calls; code generation/transport remain trusted.
 pub fn emit_routed(route: &crate::source_routing::CheckedRouting, dir: &Path) -> LangResult<()> {
+    if crate::compute::needed(route.module().program()) {
+        return Err("the routed host ABI does not support compute-v2 programs; use the compute bundle and resident pipeline API".into());
+    }
     for stage in &route.package().stages {
         if !matches!(
             (stage.backend.as_str(), stage.domain.as_str()),
