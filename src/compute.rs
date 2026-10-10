@@ -53,11 +53,17 @@ fn wg(t: &Type) -> LangResult<String> {
     })
 }
 fn desc(t: &Type, p: &Program) -> LangResult<Value> {
+    desc_inner(t, p, 0)
+}
+fn desc_inner(t: &Type, p: &Program, depth: usize) -> LangResult<Value> {
+    if depth > 32 {
+        return Err("packed value type depth exceeded".into());
+    }
     Ok(match t {
-        Type::List(t) => json!({"kind":"list","element":desc(t,p)?}),
-        Type::Vector(t, n) => json!({"kind":"vector","element":desc(t,p)?,"size":n}),
+        Type::List(t) => json!({"kind":"list","element":desc_inner(t,p,depth+1)?}),
+        Type::Vector(t, n) => json!({"kind":"vector","element":desc_inner(t,p,depth+1)?,"size":n}),
         Type::Named(n) => {
-            json!({"kind":"record","name":n,"fields":p.records.get(n).ok_or("unknown record")?.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?})
+            json!({"kind":"record","name":n,"fields":p.records.get(n).ok_or("unknown record")?.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc_inner(t,p,depth+1)?}))).collect::<LangResult<Vec<_>>>()?})
         }
         Type::U32 => json!({"kind":"u32"}),
         Type::U64 => json!({"kind":"u64"}),
@@ -68,16 +74,22 @@ fn desc(t: &Type, p: &Program) -> LangResult<Value> {
     })
 }
 fn lanes(t: &Type, p: &Program, gpu: bool) -> LangResult<usize> {
+    lanes_inner(t, p, gpu, 0)
+}
+fn lanes_inner(t: &Type, p: &Program, gpu: bool, depth: usize) -> LangResult<usize> {
+    if depth > 32 {
+        return Err("packed value type depth exceeded".into());
+    }
     match t {
         Type::U32 | Type::I32 | Type::F32 | Type::Bool => Ok(1),
         Type::U64 if !gpu => Ok(2),
-        Type::Vector(t, n) => Ok(lanes(t, p, gpu)? * (*n as usize)),
+        Type::Vector(t, n) => Ok(lanes_inner(t, p, gpu, depth + 1)? * (*n as usize)),
         Type::Named(n) => p
             .records
             .get(n)
             .ok_or("unknown record")?
             .iter()
-            .try_fold(0, |a, (_, t)| Ok(a + lanes(t, p, gpu)?)),
+            .try_fold(0, |a, (_, t)| Ok(a + lanes_inner(t, p, gpu, depth + 1)?)),
         _ => {
             Err("packed compute values must be flat; GPU values use only 32-bit components".into())
         }
@@ -90,6 +102,7 @@ struct Emitter<'a> {
     budget: usize,
     depth: usize,
     graph: bool,
+    views: Vec<(Expr, Env)>,
 }
 impl Emitter<'_> {
     fn fresh(&mut self) -> String {
@@ -184,7 +197,11 @@ impl Emitter<'_> {
                 } else {
                     self.scalar(x, env, &xt)?
                 };
-                let v = self.bind(&xt, &a)?;
+                let v = if matches!(xt, Type::List(_)) {
+                    a
+                } else {
+                    self.bind(&xt, &a)?
+                };
                 let mut local = env.clone();
                 local.insert(n.clone(), (v, xt));
                 self.scalar(b, &local, t)
@@ -236,8 +253,11 @@ impl Emitter<'_> {
                     Ok(out)
                 } else {
                     let y = self.scalar(b, env, &ot)?;
-                    if op == "==" && matches!(ot, Type::Vector(..)) {
-                        return Ok(format!("all({x} == {y})"));
+                    if matches!(ot, Type::Vector(..)) && ["==", "!="].contains(&op.as_str()) {
+                        return Ok(format!(
+                            "{}({x} {op} {y})",
+                            if op == "==" { "all" } else { "any" }
+                        ));
                     }
                     Ok(self.add(op, &x, &y, &ot))
                 }
@@ -308,35 +328,48 @@ impl Emitter<'_> {
                 Ok(out)
             }
             Expr::Method(xs, n, a) if n == "at_or" => {
-                let Type::List(et) = check::infer(xs, &Self::types(env), self.p)? else {
-                    return Err("list required".into());
-                };
                 let idx = self.scalar(&a[0], env, &Type::U32)?;
                 let idx = self.bind(&Type::U32, &idx)?;
+                let len = self.length(xs, env)?;
                 let out = self.fresh();
-                let ty = self.ty(t)?;
-                self.line(format!("var {out}:{ty};"));
-                let (len, read) = {
-                    let Expr::Var(n) = xs.as_ref() else {
-                        return Err("GPU indexed reads require an input list".into());
-                    };
-                    let (slot, _) = env.get(n).ok_or("unknown input list")?;
-                    (
-                        if self.graph {
-                            format!("a{slot}[0]")
-                        } else {
-                            format!("ink_meta[{slot}]")
-                        },
-                        if self.graph {
-                            graph::load_list(&et, &format!("a{slot}"), &idx, self.p)?
-                        } else {
-                            load(&et, &format!("a{slot}"), &idx, self.p)?
-                        },
-                    )
-                };
-                self.line(format!("if ({idx} < {len}) {{ {out}={read}; }} else {{"));
+                self.line(format!("var {out}:{};if({idx}<{len}){{", wg(t)?));
+                let v = self.element(xs, &idx, env)?;
+                self.line(format!("{out}={v};}}else{{"));
                 let v = self.scalar(&a[1], env, t)?;
-                self.line(format!("{out}={v};\n}}"));
+                self.line(format!("{out}={v};}}"));
+                Ok(out)
+            }
+            Expr::Call(n, a) if n == "count" => self.length(&a[0], env),
+            Expr::Call(n, a) if n == "sum" || n == "foldr" => {
+                let len = self.length(&a[0], env)?;
+                let init = if n == "sum" {
+                    if *t == Type::F32 {
+                        "0.0".into()
+                    } else if *t == Type::I32 {
+                        "0i".into()
+                    } else {
+                        "0u".into()
+                    }
+                } else {
+                    self.scalar(&a[1], env, t)?
+                };
+                let out = self.bind(t, &init)?;
+                let i = self.fresh();
+                self.line(if n == "sum" {
+                    format!("for(var {i}=0u;{i}<{len};{i}++){{")
+                } else {
+                    format!("for(var {i}={len};{i}>0u;){{{i}--; ")
+                });
+                let item = self.element(&a[0], &i, env)?;
+                let v = if n == "sum" {
+                    self.add("+", &out, &item, t)
+                } else {
+                    let Type::List(et) = check::infer(&a[0], &Self::types(env), self.p)? else {
+                        return Err("fold input".into());
+                    };
+                    self.apply(&a[2], env, vec![(item, *et), (out.clone(), t.clone())], t)?
+                };
+                self.line(format!("{out}={v};}}"));
                 Ok(out)
             }
 
@@ -352,10 +385,8 @@ impl Emitter<'_> {
                 let mut local = Env::new();
                 for ((n, t), a) in f.params.iter().zip(a) {
                     if matches!(t, Type::List(_)) {
-                        let Expr::Var(v) = a else {
-                            return Err("shader helper list arguments must be input lists".into());
-                        };
-                        local.insert(n.clone(), env.get(v).ok_or("unknown list")?.clone());
+                        let v = self.list(a, env, Some(t))?;
+                        local.insert(n.clone(), (v, t.clone()));
                     } else {
                         let v = if matches!(t, Type::List(_)) {
                             self.list(a, env, Some(t))?
@@ -371,8 +402,301 @@ impl Emitter<'_> {
             _ => Err("unsupported scalar compute expression".into()),
         }
     }
-    fn list(&mut self, _e: &Expr, _env: &Env, _want: Option<&Type>) -> LangResult<String> {
-        Err("nested GPU collections require another pipeline step".into())
+    fn list(&mut self, e: &Expr, env: &Env, _want: Option<&Type>) -> LangResult<String> {
+        let i = self.views.len();
+        self.views.push((e.clone(), env.clone()));
+        Ok(format!("view{i}"))
+    }
+    fn apply(
+        &mut self,
+        e: &Expr,
+        env: &Env,
+        values: Vec<(String, Type)>,
+        t: &Type,
+    ) -> LangResult<String> {
+        let mut env = env.clone();
+        let mut body = e;
+        for (v, t) in values {
+            let Expr::Lambda(n, b) = body else {
+                return Err("lambda arity".into());
+            };
+            let v = self.bind(&t, &v)?;
+            env.insert(n.clone(), (v, t));
+            body = b;
+        }
+        self.scalar(body, &env, t)
+    }
+    fn resolve(&self, e: &Expr, env: &Env) -> Option<(Expr, Env)> {
+        if let Expr::Var(n) = e {
+            let (v, _) = env.get(n)?;
+            if let Some(i) = v.strip_prefix("view") {
+                return self.views.get(i.parse::<usize>().ok()?).cloned();
+            }
+        }
+        None
+    }
+    fn with_list_body(&mut self, e: &Expr, env: &Env) -> LangResult<Option<(Expr, Env)>> {
+        if let Some(v) = self.resolve(e, env) {
+            return Ok(Some(v));
+        }
+        match e {
+            Expr::Let(n, annotation, x, b) => {
+                let t = check::infer_context(x, &Self::types(env), self.p, annotation.as_deref())?;
+                let v = if matches!(t, Type::List(_)) {
+                    self.list(x, env, Some(&t))?
+                } else {
+                    let v = self.scalar(x, env, &t)?;
+                    self.bind(&t, &v)?
+                };
+                let mut local = env.clone();
+                local.insert(n.clone(), (v, t));
+                Ok(Some((*b.clone(), local)))
+            }
+            Expr::Call(n, args) if n == "repeat" => {
+                let Expr::Num(bound) = args[0] else {
+                    return Err("GPU repeat bound".into());
+                };
+                if bound > 16 {
+                    return Err("GPU collection unrolling work limit; CPU fallback".into());
+                }
+                let Type::List(_) = check::infer(e, &Self::types(env), self.p)? else {
+                    return Err("list repeat".into());
+                };
+                let Expr::Lambda(i, inner) = &args[2] else {
+                    return Err("repeat index".into());
+                };
+                let Expr::Lambda(acc, body) = inner.as_ref() else {
+                    return Err("repeat accumulator".into());
+                };
+                let t = check::infer(&args[1], &Self::types(env), self.p)?;
+                let mut v = self.list(&args[1], env, Some(&t))?;
+                for index in 0..bound {
+                    let mut local = env.clone();
+                    local.insert(i.clone(), (format!("{index}u"), Type::U32));
+                    local.insert(acc.clone(), (v, t.clone()));
+                    v = self.list(body, &local, Some(&t))?;
+                }
+                Ok(Some((
+                    Expr::Var("ink_repeat_value".into()),
+                    BTreeMap::from([("ink_repeat_value".into(), (v, t))]),
+                )))
+            }
+            Expr::Call(n, args) if n == "choose" => Ok(None),
+            Expr::Call(n, args) => {
+                let f = self
+                    .p
+                    .functions
+                    .iter()
+                    .find(|f| &f.name == n)
+                    .ok_or("GPU list call")?
+                    .clone();
+                let mut local = Env::new();
+                for ((n, t), a) in f.params.iter().zip(args) {
+                    let v = if matches!(t, Type::List(_)) {
+                        self.list(a, env, Some(t))?
+                    } else {
+                        let v = self.scalar(a, env, t)?;
+                        self.bind(t, &v)?
+                    };
+                    local.insert(n.clone(), (v, t.clone()));
+                }
+                Ok(Some((f.body, local)))
+            }
+            _ => Ok(None),
+        }
+    }
+    fn length(&mut self, e: &Expr, env: &Env) -> LangResult<String> {
+        if self.depth >= 48 {
+            return Err("GPU collection lowering depth budget".into());
+        }
+        self.depth += 1;
+        let r = self.length_inner(e, env);
+        self.depth -= 1;
+        r
+    }
+    fn length_inner(&mut self, e: &Expr, env: &Env) -> LangResult<String> {
+        if let Some((e, env)) = self.with_list_body(e, env)? {
+            return self.length(&e, &env);
+        }
+        match e {
+            Expr::Var(n) => {
+                let (slot, _) = env.get(n).ok_or("list binding")?;
+                Ok(format!("a{slot}[0u]"))
+            }
+            Expr::Call(n, a) if n == "choose" => {
+                let c = self.scalar(&a[0], env, &Type::Bool)?;
+                let out = self.fresh();
+                self.line(format!("var {out}:u32;if({c}){{"));
+                let x = self.length(&a[1], env)?;
+                self.line(format!("{out}={x};}}else{{"));
+                let x = self.length(&a[2], env)?;
+                self.line(format!("{out}={x};}}"));
+                Ok(out)
+            }
+            Expr::Method(xs, n, a) => {
+                let len = self.length(xs, env)?;
+                if n == "zip" {
+                    let other = self.length(&a[0], env)?;
+                    Ok(format!("min({len},{other})"))
+                } else if n == "filter" {
+                    let out = self.bind(&Type::U32, "0u")?;
+                    let i = self.fresh();
+                    self.line(format!("for(var {i}=0u;{i}<{len};{i}++){{"));
+                    let item = self.element(xs, &i, env)?;
+                    let Type::List(et) = check::infer(xs, &Self::types(env), self.p)? else {
+                        return Err("list type".into());
+                    };
+                    let keep = self.apply(&a[0], env, vec![(item, *et)], &Type::Bool)?;
+                    self.line(format!("if({keep}){{{out}++;}}}}"));
+                    Ok(out)
+                } else {
+                    Ok(len)
+                }
+            }
+            _ => Err("GPU collection shape requires flat input-derived arrays".into()),
+        }
+    }
+    fn element(&mut self, e: &Expr, index: &str, env: &Env) -> LangResult<String> {
+        if self.depth >= 48 {
+            return Err("GPU collection lowering depth budget".into());
+        }
+        self.depth += 1;
+        let r = self.element_inner(e, index, env);
+        self.depth -= 1;
+        r
+    }
+    fn element_inner(&mut self, e: &Expr, index: &str, env: &Env) -> LangResult<String> {
+        if self.budget == 0 {
+            return Err("GPU collection emission budget".into());
+        }
+        self.budget -= 1;
+        if let Some((e, env)) = self.with_list_body(e, env)? {
+            return self.element(&e, index, &env);
+        }
+        let Type::List(et) = check::infer(e, &Self::types(env), self.p)? else {
+            return Err("GPU list type".into());
+        };
+        match e {
+            Expr::Var(n) => {
+                let (slot, _) = env.get(n).ok_or("list binding")?;
+                load_list(&et, &format!("a{slot}"), index, self.p)
+            }
+            Expr::Call(n, a) if n == "choose" => {
+                let c = self.scalar(&a[0], env, &Type::Bool)?;
+                let out = self.fresh();
+                self.line(format!("var {out}:{};if({c}){{", wg(&et)?));
+                let x = self.element(&a[1], index, env)?;
+                self.line(format!("{out}={x};}}else{{"));
+                let x = self.element(&a[2], index, env)?;
+                self.line(format!("{out}={x};}}"));
+                Ok(out)
+            }
+            Expr::Method(xs, n, a) => {
+                let Type::List(st) = check::infer(xs, &Self::types(env), self.p)? else {
+                    return Err("list type".into());
+                };
+                if n == "scan" {
+                    let out = self.bind(
+                        &et,
+                        if *et == Type::F32 {
+                            "0.0"
+                        } else if *et == Type::I32 {
+                            "0i"
+                        } else {
+                            "0u"
+                        },
+                    )?;
+                    let i = self.fresh();
+                    self.line(format!("for(var {i}=0u;{i}<={index};{i}++){{"));
+                    let v = self.element(xs, &i, env)?;
+                    let v = self.add("+", &out, &v, &et);
+                    self.line(format!("{out}={v};}}"));
+                    return Ok(out);
+                }
+                if n == "filter" {
+                    let len = self.length(xs, env)?;
+                    let seen = self.bind(&Type::U32, "0u")?;
+                    let out = self.fresh();
+                    self.line(format!("var {out}:{};", wg(&et)?));
+                    let i = self.fresh();
+                    self.line(format!("for(var {i}=0u;{i}<{len};{i}++){{"));
+                    let v = self.element(xs, &i, env)?;
+                    let v = self.bind(&et, &v)?;
+                    let keep = self.apply(&a[0], env, vec![(v.clone(), *st)], &Type::Bool)?;
+                    self.line(format!(
+                        "if({keep}){{if({seen}=={index}){{{out}={v};break;}}{seen}++;}}}}"
+                    ));
+                    return Ok(out);
+                }
+                if n == "sort" {
+                    let len = self.length(xs, env)?;
+                    let out = self.fresh();
+                    self.line(format!("var {out}:{};", wg(&et)?));
+                    let i = self.fresh();
+                    let j = self.fresh();
+                    self.line(format!("for(var {i}=0u;{i}<{len};{i}++){{"));
+                    let v = self.element(xs, &i, env)?;
+                    let v = self.bind(&et, &v)?;
+                    let rank = self.bind(&Type::U32, "0u")?;
+                    self.line(format!("for(var {j}=0u;{j}<{len};{j}++){{"));
+                    let other = self.element(xs, &j, env)?;
+                    let other = self.bind(&et, &other)?;
+                    self.line(format!("if({other}<{v}||({other}=={v}&&{j}<{i})){{{rank}++;}}}}if({rank}=={index}){{{out}={v};break;}}}}"));
+                    return Ok(out);
+                }
+                let v = self.element(xs, index, env)?;
+                match n.as_str() {
+                    "map" => self.apply(&a[0], env, vec![(v, *st)], &et),
+                    "map_indexed" => {
+                        self.apply(&a[0], env, vec![(index.into(), Type::U32), (v, *st)], &et)
+                    }
+                    "zip" => {
+                        let other = self.element(&a[0], index, env)?;
+                        let Type::List(ot) = check::infer(&a[0], &Self::types(env), self.p)? else {
+                            return Err("zip list".into());
+                        };
+                        self.apply(&a[1], env, vec![(v, *st), (other, *ot)], &et)
+                    }
+                    _ => Err("GPU collection operation".into()),
+                }
+            }
+            _ => Err("GPU collection requires flat input-derived arrays".into()),
+        }
+    }
+    fn bound_slots(&mut self, e: &Expr, env: &Env) -> LangResult<Vec<usize>> {
+        if self.depth >= 48 {
+            return Err("GPU collection lowering depth budget".into());
+        }
+        self.depth += 1;
+        let r = self.bound_slots_inner(e, env);
+        self.depth -= 1;
+        r
+    }
+    fn bound_slots_inner(&mut self, e: &Expr, env: &Env) -> LangResult<Vec<usize>> {
+        if let Some((e, env)) = self.with_list_body(e, env)? {
+            return self.bound_slots(&e, &env);
+        }
+        match e {
+            Expr::Call(n, a) if n == "choose" => {
+                let mut v = self.bound_slots(&a[1], env)?;
+                v.extend(self.bound_slots(&a[2], env)?);
+                Ok(v)
+            }
+            Expr::Var(n) => Ok(vec![env
+                .get(n)
+                .ok_or("list binding")?
+                .0
+                .parse()
+                .map_err(|_| "input slot")?]),
+            Expr::Method(xs, n, a) => {
+                let mut v = self.bound_slots(xs, env)?;
+                if n == "zip" {
+                    v.extend(self.bound_slots(&a[0], env)?)
+                }
+                Ok(v)
+            }
+            _ => Err("GPU output capacity is not input-bounded".into()),
+        }
     }
 }
 // Packed storage avoids vec3 padding, Bool storage restrictions and host-specific
@@ -409,6 +733,9 @@ fn load(t: &Type, buf: &str, index: &str, p: &Program) -> LangResult<String> {
         Ok(v)
     }
     go(t, buf, &format!("({index})*{width}u"), &mut 0, p)
+}
+fn load_list(t: &Type, buf: &str, index: &str, p: &Program) -> LangResult<String> {
+    Ok(load(t, buf, index, p)?.replace(&format!("{buf}["), &format!("{buf}[1u+")))
 }
 fn store(t: &Type, value: &str, base: &str, off: &mut usize, p: &Program) -> LangResult<String> {
     Ok(match t {
@@ -486,63 +813,6 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
     }
     let nb = f.params.len();
     decl.push_str(&format!("@group(0) @binding({nb}) var<storage,read_write> output:array<u32>;\n@group(0) @binding({}) var<storage,read> ink_meta:array<u32>;\n",nb+1));
-    let Expr::Method(xs, m, a) = &f.body else {
-        return Err("GPU array function must directly map, zip or map_indexed input arrays".into());
-    };
-    let Expr::Var(src) = xs.as_ref() else {
-        return Err(
-            "GPU source must be an input array; use separate pipeline steps for collection stages"
-                .into(),
-        );
-    };
-    let (slot, Type::List(st)) = env.get(src).ok_or("GPU input array missing")? else {
-        return Err("GPU input list missing".into());
-    };
-    let slot: usize = slot.parse().map_err(|_| "invalid array binding")?;
-    let mut lengths = vec![slot];
-    let Expr::Lambda(n, b) = a
-        .get(if m == "zip" { 1 } else { 0 })
-        .ok_or("GPU collection lambda missing")?
-    else {
-        return Err("GPU lambda missing".into());
-    };
-    let body = if m == "map" {
-        env.insert(
-            n.clone(),
-            (load(st, &format!("a{slot}"), "i", p)?, st.as_ref().clone()),
-        );
-        b.as_ref()
-    } else if m == "map_indexed" {
-        let Expr::Lambda(v, b) = b.as_ref() else {
-            return Err("GPU indexed lambda missing".into());
-        };
-        let st = st.as_ref().clone();
-        env.insert(n.clone(), ("i".into(), Type::U32));
-        env.insert(v.clone(), (load(&st, &format!("a{slot}"), "i", p)?, st));
-        b.as_ref()
-    } else if m == "zip" {
-        let Expr::Var(other) = &a[0] else {
-            return Err("GPU zip requires an input array".into());
-        };
-        let (os, Type::List(ot)) = env.get(other).ok_or("GPU zip input missing")? else {
-            return Err("GPU zip list missing".into());
-        };
-        let os: usize = os.parse().map_err(|_| "invalid zip binding")?;
-        lengths.push(os);
-        let Expr::Lambda(v, b) = b.as_ref() else {
-            return Err("GPU zip lambda missing".into());
-        };
-        let ot = ot.as_ref().clone();
-        let st = st.as_ref().clone();
-        env.insert(n.clone(), (load(&st, &format!("a{slot}"), "i", p)?, st));
-        env.insert(v.clone(), (load(&ot, &format!("a{os}"), "i", p)?, ot));
-        b.as_ref()
-    } else {
-        return Err(
-            "GPU filters, scans and sorts require additional checked primitives; CPU fallback"
-                .into(),
-        );
-    };
     let mut em = Emitter {
         p,
         lines: String::new(),
@@ -550,18 +820,45 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
         budget: 100000,
         depth: 0,
         graph: false,
+        views: vec![],
     };
-    let v = em.scalar(body, &env, et)?;
+    let lengths = em.bound_slots(&f.body, &env)?;
+    em.lines.clear();
+    let length = em.length(&f.body, &env)?;
+    em.line(format!(
+        "if(i==0u){{output[0u]={length};}}if(i>={length}){{return;}}"
+    ));
+    let v = em.element(&f.body, "i", &env)?;
     let v = em.bind(et, &v)?;
     em.line(store(
         et,
         &v,
-        &format!("i*{}u", lanes(et, p, true)?),
+        &format!("1u+i*{}u", lanes(et, p, true)?),
         &mut 0,
         p,
     )?);
     decl.push_str(&format!("@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid:vec3<u32>){{let i=gid.x;if(i>=ink_meta[{nb}]){{return;}}\n{}\n}}",em.lines));
     Ok((decl, lengths))
+}
+fn heavy(e: &Expr, p: &Program, seen: &mut std::collections::BTreeSet<String>) -> bool {
+    match e {
+        Expr::Method(x, n, a) => {
+            ["filter", "scan", "sort"].contains(&n.as_str())
+                || heavy(x, p, seen)
+                || a.iter().any(|e| heavy(e, p, seen))
+        }
+        Expr::Call(n, a) => {
+            a.iter().any(|e| heavy(e, p, seen))
+                || p.functions
+                    .iter()
+                    .find(|f| &f.name == n)
+                    .is_some_and(|f| seen.insert(n.clone()) && heavy(&f.body, p, seen))
+        }
+        Expr::Let(_, _, a, b) | Expr::Binary(_, a, b) => heavy(a, p, seen) || heavy(b, p, seen),
+        Expr::Lambda(_, b) | Expr::Neg(b) | Expr::Field(b, _) => heavy(b, p, seen),
+        Expr::Record(_, fs) => fs.iter().any(|(_, e)| heavy(e, p, seen)),
+        _ => false,
+    }
 }
 pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> {
     let p = checked.pure_program()?;
@@ -584,7 +881,8 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
             }
             Err(e) => (None, Some(e)),
         };
-        let required = shader.is_none() && graph.is_some();
+        let required = graph.is_some()
+            && (shader.is_none() || heavy(&f.body, p, &mut std::collections::BTreeSet::new()));
         let reason = if shader.is_some() || graph.is_some() {
             None
         } else {
@@ -594,10 +892,10 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
                 graph_reason.unwrap_or_default()
             ))
         };
-        functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"graph":graph,"graph_required":required,"fallback_reason":reason}));
+        functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"graph":graph,"graph_required":required,"capacity_mode":"max","gpu_max_elements":if !required && heavy(&f.body,p,&mut std::collections::BTreeSet::new()){Some(128)}else{None},"fallback_reason":reason}));
     }
     use sha2::{Digest, Sha256};
-    let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; records in declaration order; vectors unpadded","float_contract":"portable f32 follows WGSL permitted floating evaluation, including rounding, reassociation, fusion, flush-to-zero and finite-math assumptions; lowering emits source order; CPU reference uses binary32; bitwise equivalence is not promised","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; profiling establishes profitability only"});
+    let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; GPU lists carry a length header; records in declaration order; vectors unpadded","gpu_list_abi":"ink-gpu-list-v3","collection_strategy":"literal per-output evaluation; filters, ordered scans and stable rank sorts may do quadratic or greater work; profitability must be measured","float_contract":"portable f32 follows WGSL permitted floating evaluation, including rounding, reassociation, fusion, flush-to-zero and finite-math assumptions; lowering emits source order; CPU reference uses binary32; bitwise equivalence is not promised","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; profiling establishes profitability only"});
     Ok(crate::gpu::Emission {
         manifest,
         shaders: files,

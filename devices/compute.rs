@@ -174,7 +174,22 @@ impl Gpu {
         let input = p
             .constants
             .iter()
-            .map(|c| self.buffer(c.words.len() * 4, U::STORAGE, Some(&c.words)))
+            .enumerate()
+            .map(|(i, c)| {
+                let list = p
+                    .steps
+                    .iter()
+                    .flat_map(|s| &s.args)
+                    .any(|a| !a.step && a.index == i && a.ty["kind"] == "list");
+                let words = if list {
+                    std::iter::once(c.count as u32)
+                        .chain(c.words.iter().copied())
+                        .collect::<Vec<_>>()
+                } else {
+                    c.words.as_ref().clone()
+                };
+                self.buffer(words.len() * 4, U::STORAGE, Some(&words))
+            })
             .collect::<Result<Vec<_>>>()?;
         let banks = (0..2)
             .map(|_| {
@@ -182,7 +197,7 @@ impl Gpu {
                     .iter()
                     .map(|s| {
                         self.buffer(
-                            s.count.unwrap() * width(&s.f["result"]) * 4,
+                            (1 + s.count.unwrap() * width(&s.f["result"])) * 4,
                             U::STORAGE | U::COPY_SRC,
                             None,
                         )
@@ -271,7 +286,7 @@ impl Gpu {
             .outputs
             .iter()
             .map(|i| {
-                let bytes = p.steps[*i].count.unwrap() * width(&p.steps[*i].f["result"]) * 4;
+                let bytes = (1 + p.steps[*i].count.unwrap() * width(&p.steps[*i].f["result"])) * 4;
                 let b = self.buffer(bytes, U::MAP_READ | U::COPY_DST, None)?;
                 if bytes > 0 {
                     encoder.copy_buffer_to_buffer(
@@ -303,13 +318,20 @@ impl Gpu {
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
             let mapped = b.slice(..).get_mapped_range().map_err(|e| e.to_string())?;
-            let words = mapped[..bytes]
+            let words: Vec<u32> = mapped[..bytes]
                 .chunks_exact(4)
                 .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
                 .collect();
+            let count = words[0] as usize;
+            let n = count
+                .checked_mul(width(&p.steps[i].f["result"]))
+                .ok_or("GPU result length")?;
+            if n > words.len() - 1 {
+                return Err("invalid GPU result length".into());
+            }
             let d = Data {
-                words: Arc::new(words),
-                count: p.steps[i].count.unwrap(),
+                words: Arc::new(words[1..1 + n].to_vec()),
+                count,
                 finite: true,
             };
             values.insert(p.steps[i].id.clone(), unpack(&d, &p.steps[i].f["result"]));
@@ -318,7 +340,7 @@ impl Gpu {
             readback += bytes;
         }
         Ok(
-            json!({"values":values,"counters":{"upload_bytes":p.constants.iter().map(|c|c.words.len()*4).sum::<usize>()+p.steps.iter().map(|s|4*(s.args.len()+1)).sum::<usize>(),"readback_bytes":readback,"dispatches":p.steps.iter().filter(|s|s.count!=Some(0)).count()*p.iterations,"live_buffer_bytes":p.bytes}}),
+            json!({"values":values,"counters":{"upload_bytes":input.iter().map(|b|b.size() as usize).sum::<usize>()+p.steps.iter().map(|s|4*(s.args.len()+1)).sum::<usize>(),"readback_bytes":readback,"dispatches":p.steps.iter().filter(|s|s.count!=Some(0)).count()*p.iterations,"live_buffer_bytes":p.bytes}}),
         )
     }
 }
