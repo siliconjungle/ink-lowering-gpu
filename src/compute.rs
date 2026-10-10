@@ -1,9 +1,9 @@
 //! WGSL pure compute lowering. Logical values have a versioned packed ABI;
 //! shader eligibility does not assert or select an optimisation law.
 use crate::{check, core, syntax::*, LangResult};
-pub use ink_lowering_c::compute::needed;
+pub use ink_core::compute_values::needed;
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, fs, path::Path};
+use std::collections::BTreeMap;
 type Env = BTreeMap<String, (String, Type)>;
 
 fn wg(t: &Type) -> LangResult<String> {
@@ -517,10 +517,8 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
     decl.push_str(&format!("@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid:vec3<u32>){{let i=gid.x;if(i>=ink_meta[{nb}]){{return;}}\n{}\n}}",em.lines));
     Ok((decl, lengths))
 }
-pub fn emit_bundle(p: &Program, dir: &Path) -> LangResult<()> {
-    let checked = core::CheckedModule::from_source(p.clone())?;
-    checked.pure_program()?;
-    let c = ink_lowering_c::compute::emit_c(p)?;
+pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> {
+    let p = checked.pure_program()?;
     let mut files = BTreeMap::new();
     let mut functions = Vec::new();
     for (i, f) in p.functions.iter().enumerate() {
@@ -536,41 +534,9 @@ pub fn emit_bundle(p: &Program, dir: &Path) -> LangResult<()> {
         functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"fallback_reason":reason}));
     }
     use sha2::{Digest, Sha256};
-    let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"cpu_c_sha256":format!("{:x}",Sha256::digest(c.as_bytes())),"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; records in declaration order; vectors unpadded","float_contract":"portable f32 follows WGSL permitted floating evaluation, including rounding, reassociation, fusion, flush-to-zero and finite-math assumptions; lowering emits source order; CPU reference uses binary32; bitwise equivalence is not promised","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; profiling establishes profitability only"});
-    let manifest = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-    fs::create_dir_all(dir.join("native/src")).map_err(|e| e.to_string())?;
-    let put = |n: &str, s: &str| fs::write(dir.join(n), s).map_err(|e| e.to_string());
-    put("manifest.json", &manifest)?;
-    put("cpu.c", &c)?;
-    put("ink-gpu.mjs", include_str!("../runtime/ink-compute.mjs"))?;
-    put(
-        "native/Cargo.toml",
-        include_str!("../runtime/gpu-native/Cargo.toml"),
-    )?;
-    put(
-        "native/Cargo.lock",
-        include_str!("../runtime/gpu-native/Cargo.lock"),
-    )?;
-    put(
-        "native/build.rs",
-        include_str!("../runtime/gpu-native/build.rs"),
-    )?;
-    put("native/cpu.c", &c)?;
-    put(
-        "native/src/lib.rs",
-        include_str!("../runtime/compute-native.rs"),
-    )?;
-    put(
-        "native/src/main.rs",
-        include_str!("../runtime/compute-main.rs"),
-    )?;
-    let mut assets =
-        format!("pub const MANIFEST:&str={manifest:?};\npub const SHADERS:&[(&str,&str)]=&[\n");
-    for (n, s) in &files {
-        put(n, s)?;
-        assets.push_str(&format!("({n:?},{s:?}),\n"));
-    }
-    assets.push_str("];\n");
-    put("native/src/assets.rs", &assets)?;
-    Ok(())
+    let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; records in declaration order; vectors unpadded","float_contract":"portable f32 follows WGSL permitted floating evaluation, including rounding, reassociation, fusion, flush-to-zero and finite-math assumptions; lowering emits source order; CPU reference uses binary32; bitwise equivalence is not promised","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; profiling establishes profitability only"});
+    Ok(crate::gpu::Emission {
+        manifest,
+        shaders: files,
+    })
 }

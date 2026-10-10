@@ -1,9 +1,9 @@
 //! Literal WebGPU lowering. Eligibility is a backend capability check, not an
 //! optimisation theorem. Every source collection stage remains a separate stage.
-use crate::{check, core, native, syntax::*, LangResult};
+use crate::{check, core, syntax::*, LangResult};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, path::Path};
+use std::collections::BTreeMap;
 
 fn kind(t: &Type) -> LangResult<String> {
     Ok(match t {
@@ -248,50 +248,16 @@ fn candidate(p: &Program, f: &Function) -> LangResult<(Value, Vec<(String, Strin
         output,
     ))
 }
-fn put(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> LangResult<()> {
-    fs::write(dir.join(name), bytes).map_err(|e| e.to_string())
+/// A target artifact contains no scheduling or CPU fallback policy.
+pub struct Emission {
+    pub manifest: Value,
+    pub shaders: BTreeMap<String, String>,
 }
-
-/// Emit browser and standalone native host code with the same WGSL primitives.
-/// The native project links generated C for CPU fallback, never an interpreter.
-pub fn emit_selected(
-    selected: &ink_core::optimisation::CheckedSelection,
-    dir: &Path,
-) -> LangResult<()> {
-    emit(selected.module().pure_program()?, dir)
-}
-pub fn emit(p: &Program, dir: &Path) -> LangResult<()> {
+pub fn lower(checked: &core::CheckedModule) -> LangResult<Emission> {
+    let p = checked.pure_program()?;
     if crate::compute::needed(p) {
-        return crate::compute::emit_bundle(p, dir);
+        return crate::compute::lower(checked);
     }
-    emit_bundle(p, dir, None)
-}
-
-/// Placement of literal checked source calls; code generation/transport remain trusted.
-pub fn emit_routed(route: &crate::source_routing::CheckedRouting, dir: &Path) -> LangResult<()> {
-    if crate::compute::needed(route.module().program()) {
-        return Err("the routed host ABI does not support compute-v2 programs; use the compute bundle and resident pipeline API".into());
-    }
-    for stage in &route.package().stages {
-        if !matches!(
-            (stage.backend.as_str(), stage.domain.as_str()),
-            ("c", "cpu") | ("gpu", "gpu")
-        ) {
-            return Err("this mixed bundle supports c/cpu and gpu/gpu placements".into());
-        }
-    }
-    emit_bundle(route.module().pure_program()?, dir, Some(route))
-}
-
-fn emit_bundle(
-    p: &Program,
-    dir: &Path,
-    route: Option<&crate::source_routing::CheckedRouting>,
-) -> LangResult<()> {
-    let checked = core::CheckedModule::from_source(p.clone())?;
-    checked.pure_program()?;
-    let mut c = native::emit(p)?;
-    c.push_str("\nuint64_t ink_cpu_call(uint32_t function,const void *const *lists,const size_t *lengths,const uint64_t *scalars){\n(void)lists;(void)lengths;(void)scalars;\nswitch(function){\n");
     let mut files = Vec::new();
     let mut functions = Vec::new();
     for (index, f) in p.functions.iter().enumerate() {
@@ -300,28 +266,6 @@ fn emit_bundle(
             .iter()
             .map(|(n, t)| Ok(json!({"name":n,"type":kind(t)?})))
             .collect::<LangResult<Vec<_>>>()?;
-        let mut args = Vec::new();
-        for (i, (_, t)) in f.params.iter().enumerate() {
-            args.push(match t {
-                Type::List(inner) => format!(
-                    "(const {}*)lists[{i}], lengths[{i}]",
-                    if **inner == Type::U32 {
-                        "uint32_t"
-                    } else {
-                        "uint64_t"
-                    }
-                ),
-                Type::U32 => format!("(uint32_t)scalars[{i}]"),
-                Type::U64 => format!("scalars[{i}]"),
-                Type::Bool => format!("(bool)scalars[{i}]"),
-                _ => return Err("unsupported CPU ABI parameter".into()),
-            });
-        }
-        c.push_str(&format!(
-            "case {index}:return (uint64_t)lang_fn_{}({});\n",
-            f.name,
-            args.join(",")
-        ));
         let (gpu, reason) = match candidate(p, f) {
             Ok((mut metadata, stages)) => {
                 let mut descriptors = Vec::new();
@@ -337,90 +281,27 @@ fn emit_bundle(
         };
         functions.push(json!({"name":f.name,"index":index,"params":params,"result":kind(&f.result)?,"gpu":gpu,"cpu_reason":reason}));
     }
-    c.push_str("default:lang_fail();return 0;\n}\n}\n");
     files.extend([
         (
             "sum.wgsl".into(),
-            include_str!("../runtime/gpu-sum.wgsl").into(),
+            include_str!("../shaders/gpu-sum.wgsl").into(),
         ),
         (
             "count.wgsl".into(),
-            include_str!("../runtime/gpu-count.wgsl").into(),
+            include_str!("../shaders/gpu-count.wgsl").into(),
         ),
         (
             "filter-offsets.wgsl".into(),
-            include_str!("../runtime/gpu-filter-offsets.wgsl").into(),
+            include_str!("../shaders/gpu-filter-offsets.wgsl").into(),
         ),
         (
             "filter-scatter.wgsl".into(),
-            include_str!("../runtime/gpu-filter-scatter.wgsl").into(),
+            include_str!("../shaders/gpu-filter-scatter.wgsl").into(),
         ),
     ]);
-    let manifest = json!({"schema":1,"backend":"webgpu-wgpu-v1","core_semantics":core::SEMANTICS,"core_sha256":checked.identity()?,"cpu_c_sha256":format!("{:x}",Sha256::digest(c.as_bytes())),"functions":functions,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"trust":["Rust type checker","literal C and WGSL lowering","parallel u32 sum and stable filter primitives","C/LLVM and wgpu/WebGPU shader toolchains and drivers","host ABI and runtime"],"proof_claim":"no GPU backend or shader correctness proof; no new optimisation laws; literal source stages retained","selection":"bounded host-side measurements, including allocation/upload/dispatch/readback; correctness independent of profiles","limitations":["GPU subset: u32 map/filter followed by sum/count, one list and u32/Bool scalars","u64, exact integers, nested collections, order-sensitive folds and transactions remain on CPU","GPU unavailable, device loss, limits or validation errors fall back to compiled CPU","no universal performance or all-device GPU guarantee"]});
-    fs::create_dir_all(dir.join("native/src")).map_err(|e| e.to_string())?;
-    let manifest = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-    put(dir, "manifest.json", &manifest)?;
-    put(dir, "cpu.c", &c)?;
-    put(dir, "ink-gpu.mjs", include_str!("../runtime/ink-gpu.mjs"))?;
-    let route_json = route
-        .map(|r| serde_json::to_string(r.package()).map_err(|e| e.to_string()))
-        .transpose()?;
-    if let Some(route_json) = &route_json {
-        put(dir, "source-route.json", route_json)?;
-        put(
-            dir,
-            "ink-route.mjs",
-            format!(
-                "const ROUTE={route_json};\n{}",
-                include_str!("../runtime/ink-route.mjs")
-            ),
-        )?;
-    } else {
-        for name in ["source-route.json", "ink-route.mjs"] {
-            match fs::remove_file(dir.join(name)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-    }
-    put(
-        dir,
-        "native/Cargo.toml",
-        include_str!("../runtime/gpu-native/Cargo.toml"),
-    )?;
-    put(
-        dir,
-        "native/Cargo.lock",
-        include_str!("../runtime/gpu-native/Cargo.lock"),
-    )?;
-    put(
-        dir,
-        "native/build.rs",
-        include_str!("../runtime/gpu-native/build.rs"),
-    )?;
-    put(
-        dir,
-        "native/src/lib.rs",
-        include_str!("../runtime/gpu-native/src/lib.rs"),
-    )?;
-    put(
-        dir,
-        "native/src/main.rs",
-        include_str!("../runtime/gpu-native/src/main.rs"),
-    )?;
-    put(dir, "native/cpu.c", c)?;
-    let mut assets =
-        format!("pub const MANIFEST:&str={manifest:?};\npub const SHADERS:&[(&str,&str)]=&[\n");
-    for (name, shader) in files {
-        assets.push_str(&format!("({name:?},{shader:?}),\n"));
-        put(dir, &name, shader)?;
-    }
-    assets.push_str("];\n");
-    assets.push_str(&match route_json {
-        Some(s) => format!("pub const SOURCE_ROUTE:Option<&str>=Some({s:?});\n"),
-        None => "pub const SOURCE_ROUTE:Option<&str>=None;\n".into(),
-    });
-    put(dir, "native/src/assets.rs", assets)?;
-    Ok(())
+    let manifest = json!({"schema":1,"backend":"webgpu-wgpu-v1","core_semantics":core::SEMANTICS,"core_sha256":checked.identity()?,"functions":functions,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"trust":["Rust type checker","literal C and WGSL lowering","parallel u32 sum and stable filter primitives","C/LLVM and wgpu/WebGPU shader toolchains and drivers","host ABI and runtime"],"proof_claim":"no GPU backend or shader correctness proof; no new optimisation laws; literal source stages retained","selection":"bounded host-side measurements, including allocation/upload/dispatch/readback; correctness independent of profiles","limitations":["GPU subset: u32 map/filter followed by sum/count, one list and u32/Bool scalars","u64, exact integers, nested collections, order-sensitive folds and transactions remain on CPU","GPU unavailable, device loss, limits or validation errors fall back to compiled CPU","no universal performance or all-device GPU guarantee"]});
+    Ok(Emission {
+        manifest,
+        shaders: files.into_iter().collect(),
+    })
 }
