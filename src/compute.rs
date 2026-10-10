@@ -1,10 +1,43 @@
 //! WGSL pure compute lowering. Logical values have a versioned packed ABI;
 //! shader eligibility does not assert or select an optimisation law.
 use crate::{check, core, syntax::*, LangResult};
-pub use ink_core::compute_values::needed;
+/// Target-owned packed ABI classification for literal ordered stage graphs.
+/// The semantic core's value classification stays unchanged.
+pub fn needed(p: &Program) -> bool {
+    fn aggregate(e: &Expr) -> bool {
+        match e {
+            Expr::Call(n, a) => {
+                ["sum", "count", "foldr"].contains(&n.as_str()) || a.iter().any(aggregate)
+            }
+            Expr::Binary(_, a, b) | Expr::Let(_, _, a, b) => aggregate(a) || aggregate(b),
+            Expr::Method(x, _, a) => aggregate(x) || a.iter().any(aggregate),
+            Expr::Lambda(_, x) | Expr::Neg(x) | Expr::Field(x, _) => aggregate(x),
+            Expr::Record(_, fs) => fs.iter().any(|(_, x)| aggregate(x)),
+            _ => false,
+        }
+    }
+    fn ordered(e: &Expr) -> bool {
+        match e {
+            Expr::Call(n, a) => n == "foldr" || a.iter().any(ordered),
+            Expr::Binary(_, a, b) | Expr::Let(_, _, a, b) => ordered(a) || ordered(b),
+            Expr::Method(x, _, a) => ordered(x) || a.iter().any(ordered),
+            Expr::Lambda(_, x) | Expr::Neg(x) | Expr::Field(x, _) => ordered(x),
+            Expr::Record(_, fs) => fs.iter().any(|(_, x)| ordered(x)),
+            _ => false,
+        }
+    }
+    ink_core::compute_values::needed(p)
+        || p.functions.iter().any(|f| {
+            ordered(&f.body)
+                || (aggregate(&f.body)
+                    && !matches!(&f.body,Expr::Call(n,_) if n=="sum" || n=="count"))
+        })
+}
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 type Env = BTreeMap<String, (String, Type)>;
+#[path = "compute_graph.rs"]
+mod graph;
 
 fn wg(t: &Type) -> LangResult<String> {
     Ok(match t {
@@ -56,6 +89,7 @@ struct Emitter<'a> {
     next: usize,
     budget: usize,
     depth: usize,
+    graph: bool,
 }
 impl Emitter<'_> {
     fn fresh(&mut self) -> String {
@@ -288,8 +322,16 @@ impl Emitter<'_> {
                     };
                     let (slot, _) = env.get(n).ok_or("unknown input list")?;
                     (
-                        format!("ink_meta[{slot}]"),
-                        load(&et, &format!("a{slot}"), &idx, self.p)?,
+                        if self.graph {
+                            format!("a{slot}[0]")
+                        } else {
+                            format!("ink_meta[{slot}]")
+                        },
+                        if self.graph {
+                            graph::load_list(&et, &format!("a{slot}"), &idx, self.p)?
+                        } else {
+                            load(&et, &format!("a{slot}"), &idx, self.p)?
+                        },
                     )
                 };
                 self.line(format!("if ({idx} < {len}) {{ {out}={read}; }} else {{"));
@@ -418,6 +460,9 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
             "GPU v2 currently requires an array result; ordered scalar reductions use CPU".into(),
         );
     };
+    if matches!(&f.body, Expr::Method(_, m, _) if m == "concat") {
+        return Err("GPU concatenation currently uses the compiled CPU fallback".into());
+    }
     lanes(et, p, true)?;
     let mut env = Env::new();
     let mut decl = types(p, true)?;
@@ -504,6 +549,7 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
         next: 0,
         budget: 100000,
         depth: 0,
+        graph: false,
     };
     let v = em.scalar(body, &env, et)?;
     let v = em.bind(et, &v)?;
@@ -523,7 +569,7 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
     let mut functions = Vec::new();
     for (i, f) in p.functions.iter().enumerate() {
         let compiled = shader(f, p);
-        let (shader, lengths, reason) = match compiled {
+        let (shader, lengths, direct_reason) = match compiled {
             Ok((s, l)) => {
                 let path = format!("compute-{i}.wgsl");
                 files.insert(path.clone(), s);
@@ -531,7 +577,24 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
             }
             Err(e) => (None, vec![], Some(e)),
         };
-        functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"fallback_reason":reason}));
+        let (graph, graph_reason) = match graph::lower(f, p, i) {
+            Ok((descriptor, shaders)) => {
+                files.extend(shaders);
+                (Some(descriptor), None)
+            }
+            Err(e) => (None, Some(e)),
+        };
+        let required = shader.is_none() && graph.is_some();
+        let reason = if shader.is_some() || graph.is_some() {
+            None
+        } else {
+            Some(format!(
+                "{}; literal graph: {}",
+                direct_reason.unwrap_or_default(),
+                graph_reason.unwrap_or_default()
+            ))
+        };
+        functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"graph":graph,"graph_required":required,"fallback_reason":reason}));
     }
     use sha2::{Digest, Sha256};
     let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; records in declaration order; vectors unpadded","float_contract":"portable f32 follows WGSL permitted floating evaluation, including rounding, reassociation, fusion, flush-to-zero and finite-math assumptions; lowering emits source order; CPU reference uses binary32; bitwise equivalence is not promised","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; profiling establishes profitability only"});

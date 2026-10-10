@@ -1,6 +1,119 @@
+// Literal packed stage graphs. Scalars are raw lanes; internal lists have a
+// logical-length header. Capacity bounds never substitute for logical lengths.
+export function graphCapacity(graph, argumentCounts) {
+  const capacities=[];
+  const count = ref => Object.hasOwn(ref,'param') ? argumentCounts[ref.param] : capacities[ref.node];
+  for(const n of graph.nodes) {
+    const a=n.args.map(count), c=n.capacity;
+    const values=c.args.map(i=>a[i]);
+    const size=c.kind==='one'?1:c.kind==='same'?values[0]:c.kind==='min'?Math.min(...values):c.kind==='sum'?values.reduce((x,y)=>x+y,0):NaN;
+    if(!Number.isSafeInteger(size)||size<0||size>0xffffffff)throw Error('GPU graph capacity outside u32 bounds');
+    capacities.push(size);
+  }
+  const outputCount=count(graph.output);
+  if(!Number.isSafeInteger(outputCount)||outputCount<0||outputCount>0xffffffff)throw Error('GPU graph output capacity outside u32 bounds');
+  return {capacities,outputCount};
+}
+function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pipelines}) {
+  async function prepare(p) {
+    if(p.feedback.size)fail('GPU literal graph feedback is unsupported');
+    if(p.iterations*p.steps.reduce((n,s)=>n+(s.f.graph?.nodes.length??0),0)>65536)fail('GPU graph dispatch budget exceeded');
+    for(const s of p.steps) {
+      if(!s.f.graph)fail('mixed GPU graph requires a graph descriptor for every function');
+      const cap=graphCapacity(s.f.graph,s.args.map(a=>a.count));
+      const device=getDevice();
+      for(const [i,n] of s.f.graph.nodes.entries()) {
+        if(n.args.length+1>device.limits.maxStorageBuffersPerShaderStage)fail('GPU graph binding limits');
+        if(!n.ordered && Math.ceil(cap.capacities[i]/n.workgroup_size)>device.limits.maxComputeWorkgroupsPerDimension)fail('GPU graph workgroup limits');
+        if(pipelines.has(n.shader))continue;
+        device.pushErrorScope('validation');device.pushErrorScope('out-of-memory');
+        let error,pipe;
+        try {
+          const code=await(await fetch(new URL(n.shader,root))).text();
+          const bindings=device.createBindGroupLayout({entries:Array.from({length:n.args.length+1},(_,binding)=>({binding,visibility:GPUShaderStage.COMPUTE,buffer:{type:binding===n.args.length?'storage':'read-only-storage'}}))});
+          pipe=await device.createComputePipelineAsync({layout:device.createPipelineLayout({bindGroupLayouts:[bindings]}),compute:{module:device.createShaderModule({code}),entryPoint:'main'}});
+        }catch(e){error=e;}
+        const oom=await device.popErrorScope(),validation=await device.popErrorScope();
+        if(error||oom||validation)fail(String(error??oom?.message??validation?.message));
+        pipelines.set(n.shader,pipe);
+      }
+    }
+  }
+  async function run(p) {
+    const device=getDevice(),owned=[];
+    let liveBytes=0;
+    const counters={upload_bytes:0,readback_bytes:0,dispatches:0,live_buffer_bytes:0};
+    device.pushErrorScope('validation');device.pushErrorScope('out-of-memory');
+    let result,error;
+    try {
+      const make=(bytes,usage,words)=>{
+        bytes=Math.max(4,bytes);
+        if(bytes>device.limits.maxBufferSize||((usage&GPUBufferUsage.STORAGE)&&bytes>device.limits.maxStorageBufferBindingSize)||liveBytes+bytes>MAX_BYTES)fail('GPU graph buffer limits');
+        const b=device.createBuffer({size:bytes,usage,mappedAtCreation:!!words});owned.push(b);liveBytes+=bytes;counters.live_buffer_bytes=Math.max(counters.live_buffer_bytes,liveBytes);
+        if(words){new Uint32Array(b.getMappedRange()).set(words);b.unmap();counters.upload_bytes+=words.byteLength;}
+        return b;
+      };
+      const constants=p.constants.map(c=>{
+        const list=c.type.kind==='list';
+        const words=list?new Uint32Array(c.words.length+1):c.words;
+        if(list){words[0]=c.count;words.set(c.words,1);}
+        return {buffer:make(words.byteLength,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,words),type:c.type,capacity:c.count};
+      });
+      // No feedback: capacities and bindings are invariant across requested
+      // iterations. Reuse stage buffers; commands still execute every stage.
+      const values=[],stages=[];
+      for(const s of p.steps) {
+        const args=s.args.map(a=>a.kind==='step'?values[a.index]:constants[a.index]);
+        const g=s.f.graph,cap=graphCapacity(g,args.map(a=>a.capacity)),nodes=[];
+        const resolve=ref=>Object.hasOwn(ref,'param')?args[ref.param]:nodes[ref.node];
+        for(const [i,n] of g.nodes.entries()) {
+          const count=cap.capacities[i],list=n.result.kind==='list';
+          const buffer=make((count*width(n.result)+(list?1:0))*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC);
+          const pipe=pipelines.get(n.shader),inputs=n.args.map(resolve);
+          const group=device.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[...inputs.map((a,binding)=>({binding,resource:{buffer:a.buffer}})),{binding:inputs.length,resource:{buffer}}]});
+          stages.push({pipe,group,groups:n.ordered?1:Math.max(1,Math.ceil(count/n.workgroup_size))});
+          nodes.push({buffer,type:n.result,capacity:count});
+        }
+        values.push(resolve(g.output));
+      }
+      const encoder=device.createCommandEncoder();
+      for(let iter=0;iter<p.iterations;iter++) for(const s of stages) {
+        const pass=encoder.beginComputePass();pass.setPipeline(s.pipe);pass.setBindGroup(0,s.group);
+        pass.dispatchWorkgroups(s.groups);pass.end();counters.dispatches++;
+      }
+      device.queue.submit([encoder.finish()]);
+      const output=Object.fromEntries(p.outputs.map(id=>[id,values[p.ids.get(id)]]));
+      // Read a list header before copying its exact populated lanes. All
+      // intermediate data and dynamic lengths remain resident across stages.
+      const read=async(buffer,offset,bytes)=>{
+        if(!bytes)return new Uint32Array();
+        const b=make(bytes,GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST);
+        const encoder=device.createCommandEncoder();encoder.copyBufferToBuffer(buffer,offset,b,0,bytes);device.queue.submit([encoder.finish()]);
+        counters.readback_bytes+=bytes;await b.mapAsync(GPUMapMode.READ);const words=new Uint32Array(b.getMappedRange(),0,bytes/4).slice();b.unmap();b.destroy();liveBytes-=Math.max(4,bytes);return words;
+      };
+      const valuesOut={};
+      for(const [id,v] of Object.entries(output)) {
+        const list=v.type.kind==='list';let count=1;
+        if(list){count=(await read(v.buffer,0,4))[0];if(count>v.capacity)fail('GPU graph length exceeds capacity');}
+        const words=await read(v.buffer,list?4:0,count*width(v.type)*4);
+        valuesOut[id]=unpack(words,v.type);
+      }
+      result={values:valuesOut,counters};
+    }catch(e){error=e;}
+    finally {
+      const oom=await device.popErrorScope(),validation=await device.popErrorScope();
+      for(const b of owned)b.destroy();
+      if(error||oom||validation)fail(String(error??oom?.message??validation?.message));
+    }
+    return result;
+  }
+  return {prepare,run};
+}
+
 export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BYTES}) {
   let device=null, gpuError=enabled?null:"GPU disabled by host option", lost=false;
   const pipelines=new Map();
+  const graph=createGraphDevice({root,fail,width,unpack,MAX_BYTES,getDevice:()=>device,pipelines});
   async function prepare(p) {
     if (p.reason) fail(p.reason);
     if (gpuError) fail(gpuError);
@@ -16,6 +129,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
         onLost();
       });
     }
+    if(p.steps.some(s=>s.f.graph_required)) return graph.prepare(p);
     for (const s of p.steps) {
       if (s.args.length + 2 > device.limits.maxStorageBuffersPerShaderStage)
         fail("GPU binding limits");
@@ -63,6 +177,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
     }
   }
   async function runGpu(p) {
+    if(p.steps.some(s=>s.f.graph_required)) {const result=await graph.run(p);if(lost)fail("GPU device lost");return result;}
     const owned = [];
     device.pushErrorScope("validation");
     device.pushErrorScope("out-of-memory");
