@@ -255,6 +255,27 @@ fn put(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> LangResult<()> {
 /// Emit browser and standalone native host code with the same WGSL primitives.
 /// The native project links generated C for CPU fallback, never an interpreter.
 pub fn emit(p: &Program, dir: &Path) -> LangResult<()> {
+    emit_bundle(p, dir, None)
+}
+
+/// Placement of literal checked source calls; code generation/transport remain trusted.
+pub fn emit_routed(route: &crate::source_routing::CheckedRouting, dir: &Path) -> LangResult<()> {
+    for stage in &route.package().stages {
+        if !matches!(
+            (stage.backend.as_str(), stage.domain.as_str()),
+            ("c", "cpu") | ("gpu", "gpu")
+        ) {
+            return Err("this mixed bundle supports c/cpu and gpu/gpu placements".into());
+        }
+    }
+    emit_bundle(route.module().pure_program()?, dir, Some(route))
+}
+
+fn emit_bundle(
+    p: &Program,
+    dir: &Path,
+    route: Option<&crate::source_routing::CheckedRouting>,
+) -> LangResult<()> {
     let checked = core::CheckedModule::from_source(p.clone())?;
     checked.pure_program()?;
     let mut c = native::emit(p)?;
@@ -329,6 +350,28 @@ pub fn emit(p: &Program, dir: &Path) -> LangResult<()> {
     put(dir, "manifest.json", &manifest)?;
     put(dir, "cpu.c", &c)?;
     put(dir, "ink-gpu.mjs", include_str!("../runtime/ink-gpu.mjs"))?;
+    let route_json = route
+        .map(|r| serde_json::to_string(r.package()).map_err(|e| e.to_string()))
+        .transpose()?;
+    if let Some(route_json) = &route_json {
+        put(dir, "source-route.json", route_json)?;
+        put(
+            dir,
+            "ink-route.mjs",
+            format!(
+                "const ROUTE={route_json};\n{}",
+                include_str!("../runtime/ink-route.mjs")
+            ),
+        )?;
+    } else {
+        for name in ["source-route.json", "ink-route.mjs"] {
+            match fs::remove_file(dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    }
     put(
         dir,
         "native/Cargo.toml",
@@ -362,6 +405,10 @@ pub fn emit(p: &Program, dir: &Path) -> LangResult<()> {
         put(dir, &name, shader)?;
     }
     assets.push_str("];\n");
+    assets.push_str(&match route_json {
+        Some(s) => format!("pub const SOURCE_ROUTE:Option<&str>=Some({s:?});\n"),
+        None => "pub const SOURCE_ROUTE:Option<&str>=None;\n".into(),
+    });
     put(dir, "native/src/assets.rs", assets)?;
     Ok(())
 }

@@ -8,8 +8,17 @@ Capability checks identify supported emission; they are not optimisation proofs.
 The runtime measures allocation/upload/dispatch/readback costs before selecting
 whole-function CPU or GPU execution. GPU intermediates remain resident within
 its supported collection pipeline. Device loss, unsupported functions and limits
-fall back to compiled CPU code. Arbitrary cross-backend graph execution is not
-implemented yet; ink-core's checked pure routing interface is its foundation.
+fall back to compiled CPU code. Compiler-checked literal source graphs can now route calls across CPU/GPU:
+`emit_routed` accepts only ink-core's immutable source-routing witness. Browser
+`loadRoute` and native `Engine::call_route` execute the embedded graph with typed
+word/Bool/list inputs and scalar host results. Native inputs are captured once
+and shared immutably. Invalid original arguments reject before execution;
+unavailable GPU or failed shader execution retains compiled CPU fallback.
+
+`c/cpu` resolves to Wasm or native C; `gpu/gpu` resolves to WebGPU or wgpu.
+Placement and complete-cost candidate selection are external knowledge tools.
+Cross-function GPU-resident buffer bridges, effects/state placement and formal
+physical transport/code-generation proofs remain unfinished.
 
 Rust/C already compile to native machine code or Wasm through existing toolchains.
 This package does not introduce architecture-specific assembly compilers.

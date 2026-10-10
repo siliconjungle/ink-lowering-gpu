@@ -39,8 +39,8 @@ impl Backend {
 #[derive(Clone)]
 enum Arg {
     Scalar(u64),
-    U32List(Vec<u32>),
-    U64List(Vec<u64>),
+    U32List(Arc<[u32]>),
+    U64List(Arc<[u64]>),
 }
 fn parse_args(f: &Value, args: &Value) -> Result<Vec<Arg>> {
     let args = args.as_array().ok_or("arguments must be a JSON array")?;
@@ -68,14 +68,16 @@ fn parse_args(f: &Value, args: &Value) -> Result<Vec<Arg>> {
                         .ok_or("expected list")?
                         .iter()
                         .map(|x| word(x, true).map(|n| n as u32))
-                        .collect::<Result<_>>()?,
+                        .collect::<Result<Vec<_>>>()?
+                        .into(),
                 ),
                 "list_u64" => Arg::U64List(
                     v.as_array()
                         .ok_or("expected list")?
                         .iter()
                         .map(|x| word(x, false))
-                        .collect::<Result<_>>()?,
+                        .collect::<Result<Vec<_>>>()?
+                        .into(),
                 ),
                 _ => return Err("unsupported compiled type".into()),
             })
@@ -186,6 +188,54 @@ impl Engine {
     pub fn manifest(&self) -> &Value {
         &self.manifest
     }
+    /// Execute only the compiler-embedded, structurally checked pure call graph.
+    /// This does not accept runtime proposal JSON as proof of source equivalence.
+    pub fn call_route(&mut self, args: &Value) -> Result<Value> {
+        let start = Instant::now();
+        let route: Value = serde_json::from_str(assets::SOURCE_ROUTE.ok_or("bundle has no compiled route")?).map_err(|e| e.to_string())?;
+        if route["input_core_sha256"] != self.manifest["core_sha256"] {
+            return Err("compiled route core mismatch".into());
+        }
+        let entry = route["entry"].as_str().ok_or("missing route entry")?;
+        let f = self.manifest["functions"].as_array().ok_or("missing compiled functions")?.iter().find(|f| f["name"] == entry).ok_or("missing compiled route entry")?;
+        let result_bool = f["result"]=="bool";
+        let inputs = parse_args(f, args)?; // Validate/capture before any device work.
+        let mut values = BTreeMap::<String, Arg>::new();
+        let mut evidence = Vec::new();
+        let resolve = |r: &Value, values: &BTreeMap<String, Arg>| -> Result<Arg> {
+            if let Some(i) = r["Input"].as_u64() {
+                return inputs.get(i as usize).cloned().ok_or("route input out of range".into());
+            }
+            if let Some(id) = r["Stage"].as_str() {
+                return values.get(id).cloned().ok_or("missing route result".into());
+            }
+            let literal = &r["Literal"];
+            if let Some(n) = literal["U64"].as_str() {
+                return Ok(Arg::Scalar(n.parse::<u64>().map_err(|_| "invalid u64 route literal")?));
+            }
+            if let Some(n) = literal["U32"].as_u64() { return Ok(Arg::Scalar(u32::try_from(n).map_err(|_| "invalid u32 route literal")? as u64)); }
+            if let Some(b) = literal["Bool"].as_bool() { return Ok(Arg::Scalar(b as u64)); }
+            Err("invalid compiled route reference".into())
+        };
+        for stage in route["stages"].as_array().ok_or("missing route stages")? {
+            let bridge = Instant::now();
+            let arguments = stage["arguments"].as_array().ok_or("missing route arguments")?.iter().map(|r|resolve(r,&values)).collect::<Result<Vec<_>>>()?;
+            let bridge_ms = bridge.elapsed().as_secs_f64()*1000.;
+            let mode = match (stage["backend"].as_str(), stage["domain"].as_str()) {
+                (Some("c"), Some("cpu")) => Backend::Cpu,
+                (Some("gpu"), Some("gpu")) => Backend::Gpu,
+                _ => return Err("unsupported compiled placement".into()),
+            };
+            let called = Instant::now();
+            let function = self.manifest["functions"].as_array().ok_or("missing functions")?.iter().find(|f|f["name"]==stage["function"]).ok_or("missing stage function")?.clone();
+            let result = self.call_prepared(&function, &arguments, mode)?;
+            let id = stage["id"].as_str().ok_or("missing stage id")?;
+            values.insert(id.into(), Arg::Scalar(if function["result"]=="bool" {result["value"].as_bool().ok_or("invalid Bool result")? as u64} else {result["value"].as_u64().ok_or("invalid word result")?}));
+            evidence.push(json!({"id":id,"function":stage["function"],"requested":stage["domain"],"backend":result["backend"],"reason":result["reason"],"bridge_ms":bridge_ms,"execution_ms":called.elapsed().as_secs_f64()*1000.}));
+        }
+        let value = match resolve(&route["output"],&values)? { Arg::Scalar(n) => n, _ => return Err("route result must be scalar".into()) };
+        Ok(json!({"value":if result_bool {json!(value!=0)} else {json!(value)},"stages":evidence,"total_ms":start.elapsed().as_secs_f64()*1000.,"scope":"pure values; immutable inputs shared across stages; scalar stage results materialise on host; physical ABI and backends trusted"}))
+    }
     fn prepare(&mut self, f: &Value, args: &[Arg]) -> Result<()> {
         if let Some(e) = &self.gpu_error {
             return Err(e.clone());
@@ -213,6 +263,9 @@ impl Engine {
             .ok_or_else(|| format!("unknown function {name}"))?
             .clone();
         let args = parse_args(&f, args)?;
+        self.call_prepared(&f, &args, backend)
+    }
+    fn call_prepared(&mut self, f: &Value, args: &[Arg], backend: Backend) -> Result<Value> {
         let output = |value: u64, backend: &str, reason: String, profile: Option<&Profile>| json!({"value":if f["result"]=="bool" {json!(value!=0)}else{json!(value)},"backend":backend,"reason":reason,"profile":profile.map(Profile::json)});
         if backend == Backend::Cpu || f["gpu"].is_null() {
             return Ok(output(

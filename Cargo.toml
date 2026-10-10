@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 [dependencies]
-ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "f7ba1006f1c4fb11b61774b47180eddbaa68f2f7" }
-ink-lowering-c = { git = "https://github.com/siliconjungle/ink-lowering-c", rev = "d13ea2a03f5eebad9271f123628214e751ca8c86" }
+ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "d15099ea3a250fdbb02078e42d82ba16fcb91532" }
+ink-lowering-c = { git = "https://github.com/siliconjungle/ink-lowering-c", rev = "bb6ddf469cdaa38eb0ff1c852671e8b893a413d8" }
 serde_json = "1"
 sha2 = "0.10"

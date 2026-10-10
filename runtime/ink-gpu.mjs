@@ -126,7 +126,7 @@ export async function loadInk(base,options={}){
       finally{for(const buffer of resources)buffer.destroy();}
     }
   }
-  async function run(f,args){
+  async function run(f,args,backend){
     if(closed)throw Error('Ink runtime is closed');
     if(disabled.has(f.index))return {value:cpu(f,args),backend:'cpu',reason:disabled.get(f.index)};
     if(backend==='cpu'||!f.gpu)return {value:cpu(f,args),backend:'cpu',reason:backend==='cpu'?'explicit CPU selection':f.cpu_reason};
@@ -165,8 +165,9 @@ export async function loadInk(base,options={}){
   }
   return {
     manifest,
-    run(name,args){const f=functions.get(name);if(!f)return Promise.reject(Error(`unknown function ${name}`));let validated;try{validated=argumentsFor(f,args);}catch(e){return Promise.reject(e);}
-      const pending=serial.then(()=>run(f,validated));serial=pending.catch(()=>{});return pending;},
+    capture(name,args){const f=functions.get(name);if(!f)throw Error(`unknown function ${name}`);return argumentsFor(f,args);},
+    run(name,args,selection=backend){const f=functions.get(name);if(!f)return Promise.reject(Error(`unknown function ${name}`));let validated;try{if(!['auto','cpu','gpu'].includes(selection))throw Error('backend must be auto, cpu or gpu');validated=argumentsFor(f,args);}catch(e){return Promise.reject(e);}
+      const pending=serial.then(()=>run(f,validated,selection));serial=pending.catch(()=>{});return pending;},
     async close(){await serial;closed=true;device?.destroy();profiles.clear();pipelines.clear();},
   };
 }

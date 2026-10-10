@@ -27,6 +27,14 @@ fn run() -> Result<(), String> {
     let input = std::fs::read(&args[1]).map_err(|e| e.to_string())?;
     let input: serde_json::Value = serde_json::from_slice(&input).map_err(|e| e.to_string())?;
     let mut engine = Engine::new();
+    if args[0] == "--route-script" {
+        let mut results = Vec::new();
+        for args in input.as_array().ok_or("route script must be an array")? {
+            results.push(engine.call_route(args)?);
+        }
+        println!("{}", serde_json::Value::Array(results));
+        return Ok(());
+    }
     if args[0] == "--script" {
         let mut results = Vec::new();
         for step in input.as_array().ok_or("script must be an array")? {
@@ -41,7 +49,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     for _ in 0..repeat {
-        println!("{}", engine.call(&args[0], &input, backend)?);
+        println!("{}", if args[0] == "--route" { engine.call_route(&input)? } else { engine.call(&args[0], &input, backend)? });
     }
     Ok(())
 }
