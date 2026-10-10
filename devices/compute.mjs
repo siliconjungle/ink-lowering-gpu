@@ -89,12 +89,12 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
         return b;
       };
       const input = p.constants.map((c) =>
-        make(c.words.byteLength, GPUBufferUsage.STORAGE, c.words),
+        make(c.words.byteLength+(c.type.kind==="list"?4:0), GPUBufferUsage.STORAGE, c.type.kind==="list"?Uint32Array.from([c.count,...c.words]):c.words),
       );
       const banks = [0, 1].map(() =>
         p.steps.map((s) =>
           make(
-            s.count * width(s.f.result) * 4,
+            (1+s.count * width(s.f.result)) * 4,
             GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
           ),
         ),
@@ -141,7 +141,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
       }
       const reads = p.outputs.map((id) => {
         const i = p.ids.get(id),
-          bytes = p.steps[i].count * width(p.steps[i].f.result) * 4;
+          bytes = (1+p.steps[i].count * width(p.steps[i].f.result)) * 4;
         const b = make(
           bytes,
           GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
@@ -160,17 +160,17 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
       const values = {};
       for (const { id, b, bytes } of reads) {
         await b.mapAsync(GPUMapMode.READ);
-        values[id] = unpack(
-          new Uint32Array(b.getMappedRange(), 0, bytes / 4).slice(),
-          p.steps[p.ids.get(id)].f.result,
-        );
+        const words=new Uint32Array(b.getMappedRange(),0,bytes/4).slice();
+        const type=p.steps[p.ids.get(id)].f.result, count=words[0];
+        if(count*width(type)>words.length-1)fail("invalid GPU result length");
+        values[id]=unpack(words.slice(1,1+count*width(type)),type);
         b.unmap();
       }
       result = {
         values,
         counters: {
           upload_bytes:
-            p.constants.reduce((n, c) => n + c.words.byteLength, 0) +
+            p.constants.reduce((n, c) => n + c.words.byteLength+(c.type.kind==="list"?4:0), 0) +
             p.steps.reduce((n, s) => n + (s.args.length + 1) * 4, 0),
           readback_bytes: reads.reduce((n, r) => n + r.bytes, 0),
           dispatches: p.steps.filter((s) => s.count).length * p.iterations,
