@@ -255,6 +255,9 @@ fn put(dir: &Path, name: &str, bytes: impl AsRef<[u8]>) -> LangResult<()> {
 /// Emit browser and standalone native host code with the same WGSL primitives.
 /// The native project links generated C for CPU fallback, never an interpreter.
 pub fn emit(p: &Program, dir: &Path) -> LangResult<()> {
+    if crate::compute::needed(p) {
+        return crate::compute::emit_bundle(p, dir);
+    }
     let checked = core::CheckedModule::from_source(p.clone())?;
     checked.pure_program()?;
     let mut c = native::emit(p)?;
