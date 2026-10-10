@@ -24,3 +24,11 @@ Rust/C already compile to native machine code or Wasm through existing toolchain
 This package does not introduce architecture-specific assembly compilers.
 Backend/host protocols, shader primitives, drivers and target toolchains remain
 trusted. See ink-lang/docs/gpu-backend.md for supported semantics and ABI scope.
+
+Pure compute v2 supports multiple typed arrays and array outputs, numeric
+vectors/records, safe indexed reads and bounded loops. Explicit host pipelines
+retain intermediate GPU buffers across steps and iterations. Whole-pipeline
+measurements include transfer and host costs; unavailable or unsupported GPU
+execution replays on the separately versioned compiled C backend.
+Portable f32 follows WGSL evaluation rules; CPU/GPU bit identity is not promised.
+See ink-lang/docs/gpu-compute.md for the versioned ABI, limits and evidence.
