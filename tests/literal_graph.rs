@@ -157,7 +157,7 @@ fn sharing_and_capture_bounds_do_not_change_variable_scopes() {
     }
 }
 #[test]
-fn unsupported_width_emits_no_partial_graph_and_sort_remains_literal() {
+fn wide_values_use_the_shared_two_lane_graph_and_sort_remains_literal() {
     let e=emit("module Unsupported;fn sort(xs:List<u32>)->List<u32>{return xs.sort().map(fn(x)=>x+1);}fn wide(xs:List<u64>)->List<u64>{return xs.map(fn(x)=>x+1);}");
     let sort = &e.manifest["functions"][0];
     assert!(sort["graph"].is_object()); // Literal ordered sort has a graph stage.
@@ -169,11 +169,11 @@ fn unsupported_width_emits_no_partial_graph_and_sort_remains_literal() {
     assert!(sort["gpu_max_elements"].is_null());
     assert_eq!(e.manifest["gpu_list_abi"], "ink-gpu-list-v3");
     let wide = &e.manifest["functions"][1];
-    assert!(wide["graph"].is_null());
-    assert!(wide["shader"].is_null());
-    assert!(wide["fallback_reason"].is_string());
+    assert!(wide["graph"].is_object());
+    assert_eq!(wide["graph"]["nodes"][0]["op"], "map");
+    assert!(wide["fallback_reason"].is_null());
     let supported=emit("module Unsupported;fn sort(xs:List<u32>)->List<u32>{return xs.sort().map(fn(x)=>x+1);}");
-    assert_eq!(e.shaders,supported.shaders); // The rejected wide path adds no artifacts.
+    assert!(e.shaders.len() > supported.shaders.len()); // Wide arithmetic has its own literal shader.
 }
 
 #[test]
