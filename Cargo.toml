@@ -9,4 +9,4 @@ ink-lowering-c = { git = "https://github.com/siliconjungle/ink-lowering-c", rev 
 serde_json = "1"
 sha2 = "0.10"
 
-ink-lowering-js = { git = "https://github.com/siliconjungle/ink-lowering-js", rev = "c8cfb66ee1e438453485e62be16dd5cf428fa6d0" }
+ink-lowering-js = { git = "https://github.com/siliconjungle/ink-lowering-js", rev = "16bb0a1a5b370bc28b06e71f5dd23632c1601946" }
