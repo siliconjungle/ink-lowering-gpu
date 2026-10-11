@@ -16,7 +16,6 @@ export function graphCapacity(graph, argumentCounts) {
 }
 function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pipelines}) {
   async function prepare(p) {
-    if(p.feedback.size)fail('GPU literal graph feedback is unsupported');
     if(p.iterations*p.steps.reduce((n,s)=>n+(s.f.graph?.nodes.length??0),0)>65536)fail('GPU graph dispatch budget exceeded');
     for(const s of p.steps) {
       if(!s.f.graph)fail('mixed GPU graph requires a graph descriptor for every function');
@@ -42,7 +41,7 @@ function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pip
   async function run(p) {
     const device=getDevice(),owned=[];
     let liveBytes=0;
-    const counters={upload_bytes:0,readback_bytes:0,dispatches:0,live_buffer_bytes:0};
+    const counters={upload_bytes:0,readback_bytes:0,dispatches:0,live_buffer_bytes:0,resident_copy_bytes:0};
     device.pushErrorScope('validation');device.pushErrorScope('out-of-memory');
     let result,error;
     try {
@@ -57,10 +56,10 @@ function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pip
         const list=c.type.kind==='list';
         const words=list?new Uint32Array(c.words.length+1):c.words;
         if(list){words[0]=c.count;words.set(c.words,1);}
-        return {buffer:make(words.byteLength,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,words),type:c.type,capacity:c.count};
+        return {buffer:make(words.byteLength,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST,words),type:c.type,capacity:c.count};
       });
-      // No feedback: capacities and bindings are invariant across requested
-      // iterations. Reuse stage buffers; commands still execute every stage.
+      // Feedback preserves capacity bounds and bindings across iterations.
+      // List headers carry changing logical lengths.
       const values=[],stages=[];
       for(const s of p.steps) {
         const args=s.args.map(a=>a.kind==='step'?values[a.index]:constants[a.index]);
@@ -76,10 +75,32 @@ function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pip
         }
         values.push(resolve(g.output));
       }
+      // Snapshot all sources before publishing any destination: identity outputs
+      // may alias inputs, including cycles such as swapping two input buffers.
+      const pending=[...p.feedback].map(([name,index])=>{
+        const source=values[index],target=constants[p.inputs.get(name).index];
+        if(JSON.stringify(source.type)!==JSON.stringify(target.type)||source.capacity!==target.capacity)
+          fail('GPU graph feedback capacity/type mismatch');
+        const bytes=(source.capacity*width(source.type)+(source.type.kind==='list'?1:0))*4;
+        return {source:source.buffer,target:target.buffer,temporary:make(bytes,GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST),bytes};
+      });
       const encoder=device.createCommandEncoder();
-      for(let iter=0;iter<p.iterations;iter++) for(const s of stages) {
-        const pass=encoder.beginComputePass();pass.setPipeline(s.pipe);pass.setBindGroup(0,s.group);
-        pass.dispatchWorkgroups(s.groups);pass.end();counters.dispatches++;
+      for(let iter=0;iter<p.iterations;iter++) {
+        for(const s of stages) {
+          const pass=encoder.beginComputePass();pass.setPipeline(s.pipe);pass.setBindGroup(0,s.group);
+          pass.dispatchWorkgroups(s.groups);pass.end();counters.dispatches++;
+        }
+        // Leave the final iteration's exposed outputs untouched.
+        if(iter+1<p.iterations) {
+          for(const {source,temporary,bytes} of pending) {
+            if(bytes)encoder.copyBufferToBuffer(source,0,temporary,0,bytes);
+            counters.resident_copy_bytes+=bytes;
+          }
+          for(const {target,temporary,bytes} of pending) {
+            if(bytes)encoder.copyBufferToBuffer(temporary,0,target,0,bytes);
+            counters.resident_copy_bytes+=bytes;
+          }
+        }
       }
       device.queue.submit([encoder.finish()]);
       const output=Object.fromEntries(p.outputs.map(id=>[id,values[p.ids.get(id)]]));
