@@ -14,3 +14,10 @@ Current complete execution coverage, GPU exclusions and integration evidence are
 Eligible flat 32-bit array kernels include composed map/filter/zip, inclusive integer scan, stable rank sort, lazy list choice and bounded list repeat. These literal algorithms have work/expansion admission limits and can select CPU. Device buffers carry actual length through resident pipelines.
 
 When literal collection work has a supported stage graph, emission selects that eager graph rather than a quadratic per-output direct traversal. Unsupported graph forms can retain the bounded direct shader path; direct list transport uses `ink-gpu-list-v3` headers.
+
+Packed browser device adapters additionally support fixed-input `capture(plan)`
+sessions owned by the runtime host. Active required graphs and legacy shaders
+reuse input/stage/readback buffers. Setup reports one upload; repeated runs
+report actual dispatch/readback/live counters and zero upload. Dynamic list
+lengths stay in headers. No feedback or public mutable device handle is exposed.
+Host-owned serialization and close/device-loss boundaries remain explicit.
