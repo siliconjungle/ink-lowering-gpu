@@ -63,47 +63,13 @@ fn free_vars(
     bound: &mut std::collections::BTreeSet<String>,
     out: &mut std::collections::BTreeSet<String>,
 ) {
-    match e {
-        Expr::Var(n) => {
-            if !bound.contains(n) {
-                out.insert(n.clone());
-            }
-        }
-        Expr::Lambda(n, b) => {
-            let mut local = bound.clone();
-            local.insert(n.clone());
-            free_vars(b, &mut local, out);
-        }
-        Expr::Let(n, _, x, b) => {
-            free_vars(x, bound, out);
-            let mut local = bound.clone();
-            local.insert(n.clone());
-            free_vars(b, &mut local, out);
-        }
-        Expr::Binary(_, a, b) => {
-            free_vars(a, bound, out);
-            free_vars(b, bound, out);
-        }
-        Expr::Call(_, a) => {
-            for x in a {
-                free_vars(x, bound, out)
-            }
-        }
-        Expr::Method(x, _, a) => {
-            free_vars(x, bound, out);
-            for x in a {
-                free_vars(x, bound, out)
-            }
-        }
-        Expr::Neg(x) | Expr::Field(x, _) | Expr::Try(x) => free_vars(x, bound, out),
-        Expr::Record(_, fs) => {
-            for (_, x) in fs {
-                free_vars(x, bound, out)
-            }
-        }
-        _ => {}
-    }
+    out.extend(
+        ink_core::analysis::free_variables(e)
+            .into_iter()
+            .filter(|n| !bound.contains(n)),
+    );
 }
+
 impl Graph<'_> {
     fn types(env: &GraphEnv) -> check::Env {
         env.iter().map(|(n, r)| (n.clone(), r.ty.clone())).collect()
@@ -359,7 +325,6 @@ impl Graph<'_> {
             next: 0,
             budget: 100000,
             depth: 0,
-            graph: true,
             views: vec![],
             buffers: BTreeMap::new(),
         };
@@ -501,7 +466,7 @@ impl Graph<'_> {
             "filter"=>format!("if(gid.x!=0u){{return;}}var used=0u;for(var i=0u;i<{};i++){{\n{}\n}}output[0]=used;",len.unwrap(),em.lines),
             "concat"=>{let second=load_list(et,&format!("a{}",slots[1]),"i",self.p)?;format!("if(gid.x!=0u){{return;}}let n={};output[0]=n+a{}[0];for(var i=0u;i<n;i++){{{}}}for(var i=0u;i<a{}[0];i++){{{}}}",len.unwrap(),slots[1],em.lines,slots[1],store(et,&second,&format!("1u+(n+i)*{}u",lanes(et,self.p,true)?),&mut 0,self.p)?)},
             "sum"|"scan"=>format!("if(gid.x!=0u){{return;}}var acc:{}={};{}for(var i=0u;i<{};i++){{\n{}\n}}{}",wg(et)?,if *et==Type::F32{"0.0f"}else if *et==Type::I32{"0i"}else{"0u"},if op=="scan"{format!("output[0]={};",len.as_ref().unwrap())}else{String::new()},len.unwrap(),em.lines,if op=="sum"{store(ty,"acc","0u",&mut 0,self.p)?}else{String::new()}),
-            "foldr"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,graph:true,views:vec![],buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};var cursor={};loop{{if(cursor==0u){{break;}}cursor--;let i=cursor;\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
+            "foldr"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,views:vec![],buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};var cursor={};loop{{if(cursor==0u){{break;}}cursor--;let i=cursor;\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
             "count"=>format!("if(gid.x!=0u){{return;}}output[0]={};output[1]=0u;",len.unwrap()),
             _=>format!("if(gid.x!=0u){{return;}}{}",em.lines)
         }
@@ -552,7 +517,7 @@ pub(super) fn lower(
     let out = g.walk(&f.body, &env, Some(&f.result))?;
     // A raw u64 input may only pass through/count; no unsupported WGSL math.
     Ok((
-        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"literal eager array stages; ordered sums forward, folds last-to-first; no reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","serial stable filter/scan/concat/ordered reductions","portable WGSL f32; exact CPU bit identity not promised","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
+        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"literal eager array stages; ordered sums forward, foldr last-to-first and explicit fold_until forward with termination; no reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","serial stable filter/scan/concat/ordered reductions","portable WGSL f32; exact CPU bit identity not promised","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
         g.shaders,
     ))
 }

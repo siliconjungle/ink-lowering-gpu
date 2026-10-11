@@ -160,9 +160,13 @@ fn sharing_and_capture_bounds_do_not_change_variable_scopes() {
 fn unsupported_width_and_sort_fallback_have_no_partial_graph() {
     let e=emit("module Unsupported;fn sort(xs:List<u32>)->List<u32>{return xs.sort().map(fn(x)=>x+1);}fn wide(xs:List<u64>)->List<u64>{return xs.map(fn(x)=>x+1);}");
     let sort = &e.manifest["functions"][0];
-    assert!(sort["graph"].is_null()); // Graph sort remains unsupported.
-    assert!(sort["shader"].is_string()); // Upstream direct stable-rank lowering.
-    assert_eq!(sort["gpu_max_elements"], 128);
+    assert!(sort["graph"].is_object()); // Literal ordered sort has a graph stage.
+    assert!(sort["graph"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["op"] == "sort"));
+    assert!(sort["gpu_max_elements"].is_null());
     assert_eq!(e.manifest["gpu_list_abi"], "ink-gpu-list-v3");
     let wide = &e.manifest["functions"][1];
     assert!(wide["graph"].is_null());
