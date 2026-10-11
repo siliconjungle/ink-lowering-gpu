@@ -26,7 +26,9 @@ pub fn needed(p: &Program) -> bool {
             _ => false,
         }
     }
-    ink_core::compute_values::needed(p)
+    ink_core::recursion::needed(p)
+        || ink_core::local_collections::needed(p)
+        || ink_core::compute_values::needed(p)
         || p.functions.iter().any(|f| {
             ordered(&f.body)
                 || (aggregate(&f.body)
@@ -47,6 +49,14 @@ fn wg(t: &Type) -> LangResult<String> {
         Type::Bool => "bool".into(),
         Type::Vector(t, n) => format!("vec{n}<{}>", wg(t)?),
         Type::Named(n) => format!("R_{n}"),
+        Type::Buffer(inner)
+            if matches!(
+                inner.as_ref(),
+                Type::U32 | Type::I32 | Type::F32 | Type::Bool
+            ) =>
+        {
+            format!("InkBuffer_{}", wg(inner)?)
+        }
         _ => {
             return Err("GPU scalar requires a 32-bit numeric, Bool, vector or flat record".into())
         }
@@ -95,6 +105,39 @@ fn lanes_inner(t: &Type, p: &Program, gpu: bool, depth: usize) -> LangResult<usi
         }
     }
 }
+// Upper length bounds follow owners through literal emission. Complementary
+// partitions retain their common origin, so rejoining even dynamically split
+// halves stays bounded by the original length. This is emission eligibility,
+// not optimisation or proof authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BufferBound {
+    Fixed(u32),
+    Partition(Box<BufferBound>, usize, bool),
+}
+impl BufferBound {
+    fn upper(&self) -> u32 {
+        match self {
+            Self::Fixed(n) => *n,
+            Self::Partition(parent, _, _) => parent.upper(),
+        }
+    }
+    fn append(&self, other: &Self) -> Self {
+        if *other == Self::Fixed(0) {
+            return self.clone();
+        }
+        if *self == Self::Fixed(0) {
+            return other.clone();
+        }
+        if let (Self::Partition(a, id, side), Self::Partition(b, other_id, other_side)) =
+            (self, other)
+        {
+            if id == other_id && side != other_side && a == b {
+                return *a.clone();
+            }
+        }
+        Self::Fixed(self.upper() + other.upper())
+    }
+}
 struct Emitter<'a> {
     p: &'a Program,
     lines: String,
@@ -103,6 +146,7 @@ struct Emitter<'a> {
     depth: usize,
     graph: bool,
     views: Vec<(Expr, Env)>,
+    buffers: BTreeMap<String, BufferBound>,
 }
 impl Emitter<'_> {
     fn fresh(&mut self) -> String {
@@ -128,8 +172,36 @@ impl Emitter<'_> {
         let n = self.fresh();
         let ty = self.ty(t)?;
         self.line(format!("var {n}:{ty}={v};"));
+        if matches!(t, Type::Buffer(_)) {
+            let bound = self.buffer_bound(v)?;
+            self.buffers.insert(n.clone(), bound);
+        }
 
         Ok(n)
+    }
+    fn buffer_bound(&self, value: &str) -> LangResult<BufferBound> {
+        self.buffers
+            .get(value)
+            .cloned()
+            .ok_or("GPU temporary buffer has no static bound".into())
+    }
+    fn loop_buffer_bound(
+        &mut self,
+        initial: Option<BufferBound>,
+        out: &str,
+        step: &str,
+    ) -> LangResult<()> {
+        if let Some(initial) = initial {
+            let step = self.buffer_bound(step)?;
+            // Maintaining a partition bound requires preserving its provenance;
+            // an independently filled buffer of the same maximum can be longer
+            // than the actual partition. Fixed owners may shrink freely.
+            if initial != step && !matches!(initial, BufferBound::Fixed(n) if step.upper() <= n) {
+                return Err("GPU temporary loop may grow its buffer bound; CPU fallback".into());
+            }
+            self.buffers.insert(out.into(), initial);
+        }
+        Ok(())
     }
     fn add(&self, op: &str, a: &str, b: &str, t: &Type) -> String {
         if *t == Type::I32 && ["+", "-", "*"].contains(&op) {
@@ -266,12 +338,27 @@ impl Emitter<'_> {
                 let c = self.scalar(&a[0], env, &Type::Bool)?;
                 let out = self.fresh();
                 let ty = self.ty(t)?;
+                let before = self.buffers.clone();
                 self.line(format!("var {out}:{ty};"));
                 self.line(format!("if ({c}) {{"));
                 let x = self.scalar(&a[1], env, t)?;
+                let xb = self.buffers.get(&x).cloned();
                 self.line(format!("{out}={x};\n}} else {{"));
+                self.buffers = before.clone();
                 let y = self.scalar(&a[2], env, t)?;
+                let yb = self.buffers.get(&y).cloned();
                 self.line(format!("{out}={y};\n}}"));
+                self.buffers = before;
+                if matches!(t, Type::Buffer(_)) {
+                    let x = xb.ok_or("GPU branch buffer bound")?;
+                    let y = yb.ok_or("GPU branch buffer bound")?;
+                    let merged = if x == y {
+                        x
+                    } else {
+                        BufferBound::Fixed(x.upper().max(y.upper()))
+                    };
+                    self.buffers.insert(out.clone(), merged);
+                }
                 Ok(out)
             }
             Expr::Call(n, a) if ["vec2", "vec3", "vec4"].contains(&n.as_str()) => {
@@ -297,12 +384,14 @@ impl Emitter<'_> {
                 };
                 let x = self.scalar(&a[1], env, t)?;
                 let out = self.bind(t, &x)?;
+                let initial_bound = self.buffers.get(&out).cloned();
                 let idx = self.fresh();
                 self.line(format!("for(var {idx}=0u;{idx}<{bound}u;{idx}++){{"));
                 let mut local = env.clone();
                 local.insert(i.clone(), (idx, Type::U32));
                 local.insert(acc.clone(), (out.clone(), t.clone()));
                 let v = self.scalar(b, &local, t)?;
+                self.loop_buffer_bound(initial_bound, &out, &v)?;
                 self.line(format!("{out}={v};\n}}"));
                 Ok(out)
             }
@@ -326,6 +415,180 @@ impl Emitter<'_> {
                     if n == "quot_or" { "/" } else { "%" }
                 ));
                 Ok(out)
+            }
+            Expr::Call(n, a) if n == "buffer_fill" => {
+                let Type::Buffer(inner) = t else {
+                    unreachable!()
+                };
+                let Expr::Num(size) = a[0] else {
+                    return Err("GPU temporary buffers require literal capacity".into());
+                };
+                if size > 64 {
+                    return Err("GPU temporary buffer capacity exceeds 64 elements".into());
+                };
+                let value = self.scalar(&a[1], env, inner)?;
+                let value = self.bind(inner, &value)?;
+                let out = self.fresh();
+                let i = self.fresh();
+                self.line(format!("var {out}:{};{out}.length={size}u;for(var {i}=0u;{i}<{size}u;{i}++){{{out}.data[{i}]={value};}}",wg(t)?));
+                self.buffers
+                    .insert(out.clone(), BufferBound::Fixed(size as u32));
+                Ok(out)
+            }
+            Expr::Call(n, a) if n == "length" => self.length(&a[0], env),
+            Expr::Call(n, a) if n == "repeat_until" => {
+                let Expr::Num(limit) = a[0] else {
+                    return Err("GPU stopping loops require a literal limit".into());
+                };
+                if limit > 65536 {
+                    return Err("GPU stopping loop bound exceeds 65536".into());
+                };
+                let initial = self.scalar(&a[1], env, t)?;
+                let out = self.bind(t, &initial)?;
+                let initial_bound = self.buffers.get(&out).cloned();
+                let i = self.fresh();
+                self.line(format!("for(var {i}=0u;{i}<{limit}u;{i}++){{"));
+                let stop = self.apply(&a[2], env, vec![(out.clone(), t.clone())], &Type::Bool)?;
+                self.line(format!("if({stop}){{break;}}"));
+                let step = self.apply(
+                    &a[3],
+                    env,
+                    vec![(i, Type::U32), (out.clone(), t.clone())],
+                    t,
+                )?;
+                self.loop_buffer_bound(initial_bound, &out, &step)?;
+                self.line(format!("{out}={step};}}"));
+                Ok(out)
+            }
+            Expr::Method(xs, n, _)
+                if matches!(xs.as_ref(), Expr::Var(v) if v == "Buffer") && n == "empty" =>
+            {
+                let out = self.fresh();
+                self.line(format!("var {out}:{};{out}.length=0u;", wg(t)?));
+                self.buffers.insert(out.clone(), BufferBound::Fixed(0));
+                Ok(out)
+            }
+            Expr::Method(xs, n, a)
+                if matches!(
+                    check::infer(xs, &Self::types(env), self.p)?,
+                    Type::Buffer(_)
+                ) =>
+            {
+                let xt = check::infer(xs, &Self::types(env), self.p)?;
+                let Type::Buffer(inner) = &xt else {
+                    unreachable!()
+                };
+                let b = self.scalar(xs, env, &xt)?;
+                if n == "len" {
+                    return Ok(format!("{b}.length"));
+                }
+                if n == "pop" {
+                    self.line(format!("if({b}.length>0u){{{b}.length--;}}"));
+                    return Ok(b);
+                }
+                if n == "split_at" {
+                    let at = self.scalar(&a[0], env, &Type::U32)?;
+                    let at = self.bind(&Type::U32, &at)?;
+                    let left = self.fresh();
+                    let right = self.fresh();
+                    let i = self.fresh();
+                    let parent = self.buffer_bound(&b)?;
+                    let partition = self.next; // fresh owner identity, never a source-name alias
+                    self.line(format!("var {left}:{};var {right}:{};{left}.length=min({at},{b}.length);{right}.length={b}.length-{left}.length;", wg(&xt)?, wg(&xt)?));
+                    self.line(format!("for(var {i}=0u;{i}<{left}.length;{i}++){{{left}.data[{i}]={b}.data[{i}];}}"));
+                    let j = self.fresh();
+                    self.line(format!("for(var {j}=0u;{j}<{right}.length;{j}++){{{right}.data[{j}]={b}.data[{left}.length+{j}];}}"));
+                    self.buffers.insert(
+                        left.clone(),
+                        BufferBound::Partition(Box::new(parent.clone()), partition, false),
+                    );
+                    self.buffers.insert(
+                        right.clone(),
+                        BufferBound::Partition(Box::new(parent), partition, true),
+                    );
+                    return self.apply(
+                        &a[1],
+                        env,
+                        vec![(left, xt.clone()), (right, xt.clone())],
+                        &xt,
+                    );
+                }
+                if n == "append" {
+                    let other = self.scalar(&a[0], env, &xt)?;
+                    let bound = self.buffer_bound(&b)?.append(&self.buffer_bound(&other)?);
+                    if bound.upper() > 64 {
+                        return Err(
+                            "GPU temporary append capacity exceeds 64 elements; CPU fallback"
+                                .into(),
+                        );
+                    }
+                    let i = self.fresh();
+                    self.line(format!("for(var {i}=0u;{i}<{other}.length;{i}++){{{b}.data[{b}.length+{i}]={other}.data[{i}];}}{b}.length+={other}.length;"));
+                    self.buffers.insert(b.clone(), bound);
+                    return Ok(b);
+                }
+                if n == "push" {
+                    let upper = self.buffer_bound(&b)?.upper() + 1;
+                    if upper > 64 {
+                        return Err(
+                            "GPU temporary push capacity exceeds 64 elements; CPU fallback".into(),
+                        );
+                    }
+                    let value = self.scalar(&a[0], env, inner)?;
+                    self.line(format!("{b}.data[{b}.length]={value};{b}.length++;"));
+                    self.buffers.insert(b.clone(), BufferBound::Fixed(upper));
+                    return Ok(b);
+                }
+                if n == "map_parallel" {
+                    self.scalar(&a[0], env, &Type::U32)?;
+                    let i = self.fresh();
+                    self.line(format!("for(var {i}=0u;{i}<{b}.length;{i}++){{"));
+                    let value = self.apply(
+                        &a[1],
+                        env,
+                        vec![
+                            (i.clone(), Type::U32),
+                            (format!("{b}.data[{i}]"), *inner.clone()),
+                        ],
+                        inner,
+                    )?;
+                    self.line(format!("{b}.data[{i}]={value};}}"));
+                    return Ok(b);
+                }
+                if !["at_or", "set", "swap", "truncate"].contains(&n.as_str()) {
+                    return Err("GPU temporary method uses CPU fallback".into());
+                };
+                let i = self.scalar(&a[0], env, &Type::U32)?;
+                let i = self.bind(&Type::U32, &i)?;
+                match n.as_str() {
+                    "at_or" => {
+                        let out = self.fresh();
+                        self.line(format!(
+                            "var {out}:{};if({i}<{b}.length){{{out}={b}.data[{i}];}}else{{",
+                            wg(inner)?
+                        ));
+                        let value = self.scalar(&a[1], env, inner)?;
+                        self.line(format!("{out}={value};}}"));
+                        Ok(out)
+                    }
+                    "set" => {
+                        let value = self.scalar(&a[1], env, inner)?;
+                        self.line(format!("if({i}<{b}.length){{{b}.data[{i}]={value};}}"));
+                        Ok(b)
+                    }
+                    "swap" => {
+                        let j = self.scalar(&a[1], env, &Type::U32)?;
+                        let j = self.bind(&Type::U32, &j)?;
+                        let tmp = self.fresh();
+                        self.line(format!("if({i}<{b}.length&&{j}<{b}.length){{let {tmp}={b}.data[{i}];{b}.data[{i}]={b}.data[{j}];{b}.data[{j}]={tmp};}}"));
+                        Ok(b)
+                    }
+                    "truncate" => {
+                        self.line(format!("{b}.length=min({b}.length,{i});"));
+                        Ok(b)
+                    }
+                    _ => unreachable!(),
+                }
             }
             Expr::Method(xs, n, a) if n == "at_or" => {
                 let idx = self.scalar(&a[0], env, &Type::U32)?;
@@ -481,6 +744,7 @@ impl Emitter<'_> {
                     BTreeMap::from([("ink_repeat_value".into(), (v, t))]),
                 )))
             }
+            Expr::Call(n, args) if n == "parallel_map" => Ok(None),
             Expr::Call(n, args) if n == "choose" => Ok(None),
             Expr::Call(n, args) => {
                 let f = self
@@ -515,6 +779,12 @@ impl Emitter<'_> {
         r
     }
     fn length_inner(&mut self, e: &Expr, env: &Env) -> LangResult<String> {
+        if let Expr::Call(n, a) = e {
+            if n == "parallel_map" {
+                self.scalar(&a[1], env, &Type::U32)?;
+                return self.length(&a[0], env);
+            }
+        }
         if let Some((e, env)) = self.with_list_body(e, env)? {
             return self.length(&e, &env);
         }
@@ -566,6 +836,23 @@ impl Emitter<'_> {
         r
     }
     fn element_inner(&mut self, e: &Expr, index: &str, env: &Env) -> LangResult<String> {
+        if let Expr::Call(n, a) = e {
+            if n == "parallel_map" {
+                let Type::List(input) = check::infer(&a[0], &Self::types(env), self.p)? else {
+                    unreachable!()
+                };
+                let Type::List(output) = check::infer(e, &Self::types(env), self.p)? else {
+                    unreachable!()
+                };
+                let v = self.element(&a[0], index, env)?;
+                return self.apply(
+                    &a[2],
+                    env,
+                    vec![(index.into(), Type::U32), (v, *input)],
+                    &output,
+                );
+            }
+        }
         if self.budget == 0 {
             return Err("GPU collection emission budget".into());
         }
@@ -673,6 +960,11 @@ impl Emitter<'_> {
         r
     }
     fn bound_slots_inner(&mut self, e: &Expr, env: &Env) -> LangResult<Vec<usize>> {
+        if let Expr::Call(n, a) = e {
+            if n == "parallel_map" {
+                return self.bound_slots(&a[0], env);
+            }
+        }
         if let Some((e, env)) = self.with_list_body(e, env)? {
             return self.bound_slots(&e, &env);
         }
@@ -771,6 +1063,11 @@ fn store(t: &Type, value: &str, base: &str, off: &mut usize, p: &Program) -> Lan
 }
 fn types(p: &Program, _gpu: bool) -> LangResult<String> {
     let mut out = String::new();
+    for t in ["u32", "i32", "f32", "bool"] {
+        out.push_str(&format!(
+            "struct InkBuffer_{t}{{data:array<{t},64>,length:u32,}}\n"
+        ));
+    }
     for (n, fields) in &p.records {
         out.push_str(&format!("struct R_{n}{{"));
         for (n, t) in fields {
@@ -821,6 +1118,7 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
         depth: 0,
         graph: false,
         views: vec![],
+        buffers: BTreeMap::new(),
     };
     let lengths = em.bound_slots(&f.body, &env)?;
     em.lines.clear();

@@ -414,9 +414,6 @@ fn graph_ref(r: &Value, args: &[GraphData], nodes: &[GraphData]) -> Result<Graph
 }
 impl Gpu {
     fn prepare_graph(&mut self, p: &Plan) -> Result<()> {
-        if !p.feedback.is_empty() {
-            return Err("GPU literal graph feedback is unsupported".into());
-        }
         let stage_count = p
             .steps
             .iter()
@@ -555,9 +552,6 @@ impl Gpu {
     }
     fn execute_graph(&self, p: &Plan) -> Result<Value> {
         use wgpu::BufferUsages as U;
-        if !p.feedback.is_empty() {
-            return Err("GPU literal graph feedback is unsupported".into());
-        }
         let mut live = 0usize;
         let mut upload = 0usize;
         let mut make = |bytes: usize, usage: U, words: Option<&[u32]>| -> Result<wgpu::Buffer> {
@@ -590,7 +584,11 @@ impl Gpu {
                 words.extend(c.words.iter().copied());
                 upload += words.len() * 4;
                 Ok(GraphData {
-                    buffer: make(words.len() * 4, U::STORAGE | U::COPY_SRC, Some(&words))?,
+                    buffer: make(
+                        words.len() * 4,
+                        U::STORAGE | U::COPY_SRC | U::COPY_DST,
+                        Some(&words),
+                    )?,
                     ty: t,
                     capacity: c.count,
                 })
@@ -667,14 +665,54 @@ impl Gpu {
             }
             values.push(graph_ref(&g["output"], &args, &nodes)?);
         }
+        // Snapshot all feedback values before changing any input. Graph outputs
+        // may alias input buffers (for example identity functions or permutations).
+        // Logical lengths travel with each list header; capacities remain bounded.
+        let pending = p
+            .feedback
+            .iter()
+            .map(|(name, i)| {
+                let source = &values[*i];
+                let target = &constants[p.inputs[name].index];
+                if source.ty != target.ty || source.capacity != target.capacity {
+                    return Err("GPU graph feedback capacity/type mismatch".into());
+                }
+                let bytes = (source.capacity * width(&source.ty)
+                    + usize::from(source.ty["kind"] == "list"))
+                    * 4;
+                Ok((
+                    source.buffer.clone(),
+                    target.buffer.clone(),
+                    make(bytes, U::COPY_DST | U::COPY_SRC, None)?,
+                    bytes,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         drop(make);
+        let mut resident_copies = 0usize;
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        for _ in 0..p.iterations {
+        for iteration in 0..p.iterations {
             for (name, group, groups) in &dispatches {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&self.pipelines[name]);
                 pass.set_bind_group(0, group, &[]);
                 pass.dispatch_workgroups(*groups as u32, 1, 1);
+            }
+            // The final outputs must still describe the final iteration, including
+            // outputs aliasing its inputs. There is no subsequent iteration then.
+            if iteration + 1 < p.iterations {
+                for (source, _, temporary, bytes) in &pending {
+                    if *bytes > 0 {
+                        encoder.copy_buffer_to_buffer(source, 0, temporary, 0, *bytes as u64);
+                    }
+                    resident_copies += bytes;
+                }
+                for (_, target, temporary, bytes) in &pending {
+                    if *bytes > 0 {
+                        encoder.copy_buffer_to_buffer(temporary, 0, target, 0, *bytes as u64);
+                    }
+                    resident_copies += bytes;
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -724,7 +762,7 @@ impl Gpu {
             result.insert(p.steps[*i].id.clone(), unpack(&data, &v.ty));
         }
         Ok(
-            json!({"values":result,"counters":{"upload_bytes":upload,"readback_bytes":readback,"dispatches":dispatches.len()*p.iterations,"live_buffer_bytes":peak_live}}),
+            json!({"values":result,"counters":{"upload_bytes":upload,"readback_bytes":readback,"dispatches":dispatches.len()*p.iterations,"live_buffer_bytes":peak_live,"resident_copy_bytes":resident_copies}}),
         )
     }
 }

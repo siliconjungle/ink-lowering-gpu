@@ -175,11 +175,21 @@ impl Graph<'_> {
             }
         }
         if let Expr::Method(xs, n, args) = e {
-            if ["map", "map_indexed", "filter", "zip", "concat", "scan"].contains(&n.as_str()) {
+            if [
+                "map",
+                "map_indexed",
+                "filter",
+                "zip",
+                "concat",
+                "scan",
+                "sort",
+            ]
+            .contains(&n.as_str())
+            {
                 let src = self.walk(
                     xs,
                     env,
-                    if ["filter", "concat", "scan"].contains(&n.as_str()) {
+                    if ["filter", "concat", "scan", "sort"].contains(&n.as_str()) {
                         Some(&ty)
                     } else {
                         None
@@ -203,7 +213,7 @@ impl Graph<'_> {
             }
         }
         if matches!(ty, Type::List(_)) {
-            return Err("literal graph does not support this list expression (sort and dynamic list choice remain CPU)".into());
+            return Err("literal graph does not support this list expression (dynamic list choice remains CPU)".into());
         }
         let mut local = env.clone();
         let expression = self.lift(e, &mut local, Some(&ty))?;
@@ -351,6 +361,7 @@ impl Graph<'_> {
             depth: 0,
             graph: true,
             views: vec![],
+            buffers: BTreeMap::new(),
         };
         let et = leaf(ty);
         let scalar = !matches!(ty, Type::List(_));
@@ -414,6 +425,15 @@ impl Graph<'_> {
                         self.p,
                     )?);
                 }
+            }
+            "sort" => {
+                if !matches!(et, Type::U32 | Type::I32) {
+                    return Err("literal graph sort currently supports u32/i32".into());
+                }
+                let v = load_list(et, src.as_ref().unwrap(), "i", self.p)?;
+                let other = load_list(et, src.as_ref().unwrap(), "j", self.p)?;
+                em.line(format!("let item={v};var rank=0u;for(var j=0u;j<{};j++){{let other={other};if(other<item||(other==item&&j<i)){{rank++;}}}}",len.as_ref().unwrap()));
+                em.line(store(et, "item", "1u+rank", &mut 0, self.p)?);
             }
             "scan" => {
                 let v = load_list(et, src.as_ref().unwrap(), "i", self.p)?;
@@ -481,7 +501,7 @@ impl Graph<'_> {
             "filter"=>format!("if(gid.x!=0u){{return;}}var used=0u;for(var i=0u;i<{};i++){{\n{}\n}}output[0]=used;",len.unwrap(),em.lines),
             "concat"=>{let second=load_list(et,&format!("a{}",slots[1]),"i",self.p)?;format!("if(gid.x!=0u){{return;}}let n={};output[0]=n+a{}[0];for(var i=0u;i<n;i++){{{}}}for(var i=0u;i<a{}[0];i++){{{}}}",len.unwrap(),slots[1],em.lines,slots[1],store(et,&second,&format!("1u+(n+i)*{}u",lanes(et,self.p,true)?),&mut 0,self.p)?)},
             "sum"|"scan"=>format!("if(gid.x!=0u){{return;}}var acc:{}={};{}for(var i=0u;i<{};i++){{\n{}\n}}{}",wg(et)?,if *et==Type::F32{"0.0f"}else if *et==Type::I32{"0i"}else{"0u"},if op=="scan"{format!("output[0]={};",len.as_ref().unwrap())}else{String::new()},len.unwrap(),em.lines,if op=="sum"{store(ty,"acc","0u",&mut 0,self.p)?}else{String::new()}),
-            "foldr"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,graph:true,views:vec![]};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};var cursor={};loop{{if(cursor==0u){{break;}}cursor--;let i=cursor;\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
+            "foldr"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,graph:true,views:vec![],buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};var cursor={};loop{{if(cursor==0u){{break;}}cursor--;let i=cursor;\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
             "count"=>format!("if(gid.x!=0u){{return;}}output[0]={};output[1]=0u;",len.unwrap()),
             _=>format!("if(gid.x!=0u){{return;}}{}",em.lines)
         }
@@ -532,7 +552,7 @@ pub(super) fn lower(
     let out = g.walk(&f.body, &env, Some(&f.result))?;
     // A raw u64 input may only pass through/count; no unsupported WGSL math.
     Ok((
-        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"literal eager array stages; ordered sums forward, folds last-to-first; no reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","serial stable filter/scan/concat/ordered reductions","portable WGSL f32; exact CPU bit identity not promised","feedback unsupported"]}),
+        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"literal eager array stages; ordered sums forward, folds last-to-first; no reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","serial stable filter/scan/concat/ordered reductions","portable WGSL f32; exact CPU bit identity not promised","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
         g.shaders,
     ))
 }
