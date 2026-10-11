@@ -12,11 +12,41 @@ const list={kind:'list',element:{kind:'u32'}},word={kind:'u32'};
 const graph=(op,result,args,kind,indices)=>({nodes:[{id:0,op,args:args.map(param=>({param})),result,capacity:{kind,args:indices},shader:op,ordered:op!=='map',workgroup_size:op==='map'?64:1}],output:{node:0}});
 const functions=[{graph_required:true,graph:graph('filter',list,[0,1],'same',[0]),result:list},{shader:'direct-map',graph_required:false,graph:graph('map',list,[0],'same',[0]),result:list},{graph_required:true,graph:graph('sum',word,[0],'one',[]),result:word}];
 const engine=createDevice({root:new URL('http://mock/'),enabled:true,onLost(){},fail(s){throw Error(s)},width(t){return t.kind==='list'?this?.width?.(t.element)??1:1},unpack(w,t){return t.kind==='list'?[...w]:w[0]},MAX_BYTES:1024*1024});
-function plan(input,iterations=1){return {feedback:new Map(),constants:[{words:Uint32Array.from(input),type:list,count:input.length},{words:Uint32Array.of(2),type:word,count:1}],steps:[{f:functions[0],args:[{kind:'constant',index:0,count:input.length},{kind:'constant',index:1,count:1}],count:input.length},{f:functions[1],args:[{kind:'step',index:0,count:input.length}],count:input.length},{f:functions[2],args:[{kind:'step',index:1,count:input.length}],count:1}],outputs:['result'],ids:new Map([['result',2]]),iterations,reason:null};}
+function plan(input,iterations=1){return {inputs:new Map([['xs',{index:0}]]),feedback:new Map(),constants:[{words:Uint32Array.from(input),type:list,count:input.length},{words:Uint32Array.of(2),type:word,count:1}],steps:[{f:functions[0],args:[{kind:'constant',index:0,count:input.length},{kind:'constant',index:1,count:1}],count:input.length},{f:functions[1],args:[{kind:'step',index:0,count:input.length}],count:input.length},{f:functions[2],args:[{kind:'step',index:1,count:input.length}],count:1}],outputs:['result'],ids:new Map([['result',2]]),iterations,reason:null};}
 const p=plan([1,3,2,4],3);await engine.prepare(p);const result=await engine.run(p);
 assert.equal(result.values.result,9);assert.equal(result.counters.dispatches,9);assert.equal(dispatches,9);assert.equal(result.counters.upload_bytes,24);assert.equal(result.counters.readback_bytes,4);assert.equal(result.counters.live_buffer_bytes,peak);assert.equal(allocations,6);assert.equal(live,0);assert.deepEqual([...p.constants[0].words],[1,3,2,4]);
 const empty=plan([]);await engine.prepare(empty);assert.equal((await engine.run(empty)).values.result,0);assert.equal(live,0);
-const feedback=plan([1]);feedback.feedback.set('xs',0);await assert.rejects(engine.prepare(feedback),/feedback/);
+for(const input of [[1,3,2,4],[0,1],[]]) {
+  const feedback=plan(input,3);feedback.feedback.set('xs',1);
+  await engine.prepare(feedback);const actual=await engine.run(feedback);
+  const final=input.filter(x=>x>2).map(x=>x+3);
+  assert.equal(actual.values.result,final.reduce((a,b)=>a+b,0));
+  assert.equal(actual.counters.upload_bytes,input.length*4+8);
+  assert.equal(actual.counters.readback_bytes,4);
+  assert.equal(actual.counters.dispatches,9);
+  assert.equal(actual.counters.resident_copy_bytes,4*(input.length+1)*4);
+  assert.equal(live,0);
+}
+// Empty graphs expose identity inputs, so feedback destinations alias outputs.
+// An unused filter forces graph execution. Copying destinations immediately
+// would corrupt swaps; copying after the final iteration would alter outputs.
+for(const iterations of [1,2,3]) {
+  const identity={graph_required:true,result:list,graph:{nodes:[],output:{param:0}}};
+  const p={iterations,reason:null,inputs:new Map([['a',{index:0}],['b',{index:1}]]),
+    constants:[{words:Uint32Array.of(1,2),type:list,count:2},{words:Uint32Array.of(7,9),type:list,count:2},{words:Uint32Array.of(2),type:word,count:1}],
+    steps:[{f:identity,args:[{kind:'constant',index:0,count:2}],count:2},{f:identity,args:[{kind:'constant',index:1,count:2}],count:2},{f:functions[0],args:[{kind:'constant',index:0,count:2},{kind:'constant',index:2,count:1}],count:2}],
+    feedback:new Map([['a',1],['b',0]]),outputs:['a','b'],ids:new Map([['a',0],['b',1]])};
+  await engine.prepare(p);const result=await engine.run(p);
+  assert.deepEqual(result.values,iterations%2?{a:[1,2],b:[7,9]}:{a:[7,9],b:[1,2]});
+  assert.equal(result.counters.resident_copy_bytes,(iterations-1)*48);
+  assert.equal(result.counters.upload_bytes,28);assert.equal(result.counters.readback_bytes,24);
+  assert.equal(result.counters.dispatches,iterations);assert.equal(live,0);
+}
+const mismatch=plan([1]);mismatch.feedback.set('xs',2);await engine.prepare(mismatch);
+await assert.rejects(engine.run(mismatch),/capacity\/type mismatch/);assert.equal(live,0);
+const bounded=createDevice({root:new URL('http://mock/'),enabled:true,onLost(){},fail(s){throw Error(s)},width:()=>1,unpack:()=>0,MAX_BYTES:70});
+const over=plan([1,2,3,4]);over.feedback.set('xs',1);await bounded.prepare(over);
+await assert.rejects(bounded.run(over),/buffer limits/);assert.equal(live,0);bounded.close();
 assert.deepEqual(graphCapacity({nodes:[{args:[{param:0},{param:1}],capacity:{kind:'min',args:[0,1]}}],output:{node:0}},[7,3]),{capacities:[3],outputCount:3});
 assert.throws(()=>graphCapacity({nodes:[{args:[{param:0},{param:1}],capacity:{kind:'sum',args:[0,1]}}],output:{node:0}},[0xffffffff,1]),/capacity/);
-engine.close();console.log('PASS graph capacity, mixed dynamic lengths, iteration buffer reuse, exact counters, empty stages, input nonmutation, feedback fallback');
+engine.close();console.log('PASS graph capacity, mixed dynamic lengths, iteration buffer reuse, exact counters, empty stages, input nonmutation, resident feedback, alias swaps, capacity and allocation guards');
