@@ -16,7 +16,6 @@ export function graphCapacity(graph, argumentCounts) {
 }
 function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pipelines}) {
   async function prepare(p) {
-    if(p.feedback.size)fail('GPU literal graph feedback is unsupported');
     if(p.iterations*p.steps.reduce((n,s)=>n+(s.f.graph?.nodes.length??0),0)>65536)fail('GPU graph dispatch budget exceeded');
     for(const s of p.steps) {
       if(!s.f.graph)fail('mixed GPU graph requires a graph descriptor for every function');
@@ -42,7 +41,7 @@ function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pip
   async function run(p) {
     const device=getDevice(),owned=[];
     let liveBytes=0;
-    const counters={upload_bytes:0,readback_bytes:0,dispatches:0,live_buffer_bytes:0};
+    const counters={upload_bytes:0,readback_bytes:0,dispatches:0,live_buffer_bytes:0,resident_copy_bytes:0};
     device.pushErrorScope('validation');device.pushErrorScope('out-of-memory');
     let result,error;
     try {
@@ -57,10 +56,10 @@ function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pip
         const list=c.type.kind==='list';
         const words=list?new Uint32Array(c.words.length+1):c.words;
         if(list){words[0]=c.count;words.set(c.words,1);}
-        return {buffer:make(words.byteLength,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,words),type:c.type,capacity:c.count};
+        return {buffer:make(words.byteLength,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST,words),type:c.type,capacity:c.count};
       });
-      // No feedback: capacities and bindings are invariant across requested
-      // iterations. Reuse stage buffers; commands still execute every stage.
+      // Feedback preserves capacity bounds and bindings across iterations.
+      // List headers carry changing logical lengths.
       const values=[],stages=[];
       for(const s of p.steps) {
         const args=s.args.map(a=>a.kind==='step'?values[a.index]:constants[a.index]);
@@ -76,10 +75,32 @@ function createGraphDevice({root, fail, width, unpack, MAX_BYTES, getDevice, pip
         }
         values.push(resolve(g.output));
       }
+      // Snapshot all sources before publishing any destination: identity outputs
+      // may alias inputs, including cycles such as swapping two input buffers.
+      const pending=[...p.feedback].map(([name,index])=>{
+        const source=values[index],target=constants[p.inputs.get(name).index];
+        if(JSON.stringify(source.type)!==JSON.stringify(target.type)||source.capacity!==target.capacity)
+          fail('GPU graph feedback capacity/type mismatch');
+        const bytes=(source.capacity*width(source.type)+(source.type.kind==='list'?1:0))*4;
+        return {source:source.buffer,target:target.buffer,temporary:make(bytes,GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST),bytes};
+      });
       const encoder=device.createCommandEncoder();
-      for(let iter=0;iter<p.iterations;iter++) for(const s of stages) {
-        const pass=encoder.beginComputePass();pass.setPipeline(s.pipe);pass.setBindGroup(0,s.group);
-        pass.dispatchWorkgroups(s.groups);pass.end();counters.dispatches++;
+      for(let iter=0;iter<p.iterations;iter++) {
+        for(const s of stages) {
+          const pass=encoder.beginComputePass();pass.setPipeline(s.pipe);pass.setBindGroup(0,s.group);
+          pass.dispatchWorkgroups(s.groups);pass.end();counters.dispatches++;
+        }
+        // Leave the final iteration's exposed outputs untouched.
+        if(iter+1<p.iterations) {
+          for(const {source,temporary,bytes} of pending) {
+            if(bytes)encoder.copyBufferToBuffer(source,0,temporary,0,bytes);
+            counters.resident_copy_bytes+=bytes;
+          }
+          for(const {target,temporary,bytes} of pending) {
+            if(bytes)encoder.copyBufferToBuffer(temporary,0,target,0,bytes);
+            counters.resident_copy_bytes+=bytes;
+          }
+        }
       }
       device.queue.submit([encoder.finish()]);
       const output=Object.fromEntries(p.outputs.map(id=>[id,values[p.ids.get(id)]]));
@@ -278,7 +299,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
         const words=new Uint32Array(b.getMappedRange(),0,bytes/4).slice();
         const type=p.steps[p.ids.get(id)].f.result, count=words[0];
         if(count*width(type)>words.length-1)fail("invalid GPU result length");
-        values[id]=unpack(words.slice(1,1+count*width(type)),type);
+        values[id]=unpack(words.subarray(1,1+count*width(type)),type);
         b.unmap();
       }
       result = {
@@ -305,5 +326,93 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
     return result;
   }
 
-  return {prepare, run:runGpu, close(){device?.destroy();lost=true;gpuError="engine disposed";pipelines.clear();}};
+  // A prepared invocation owns fixed captured inputs and device storage. Each
+  // run submits the literal active route and returns a fresh full host result.
+  // Input capture/upload belongs to setup, not repeated execution. No feedback
+  // or mutable public device handles are exposed by this initial capability.
+  const sessions=new Set();
+  async function capture(p) {
+    if(p.feedback.size)fail('prepared GPU feedback is unsupported');
+    await prepare(p);
+    const graphMode=p.steps.some(s=>s.f.graph_required),owned=[],stages=[],values=[];
+    let live=0,closed=false;
+    const setup={upload_bytes:0,live_buffer_bytes:0,dispatches:0,readback_bytes:0};
+    const make=(bytes,usage,words)=>{
+      bytes=Math.max(4,bytes);
+      if(bytes>device.limits.maxBufferSize||((usage&GPUBufferUsage.STORAGE)&&bytes>device.limits.maxStorageBufferBindingSize)||live+bytes>MAX_BYTES)fail('prepared GPU buffer limits');
+      const b=device.createBuffer({size:bytes,usage,mappedAtCreation:!!words});owned.push(b);live+=bytes;setup.live_buffer_bytes=live;
+      if(words){new Uint32Array(b.getMappedRange()).set(words);b.unmap();setup.upload_bytes+=words.byteLength;}
+      return b;
+    };
+    const release=()=>{if(closed)return;closed=true;for(const b of owned)b.destroy();sessions.delete(session);};
+    let session;
+    device.pushErrorScope('validation');device.pushErrorScope('out-of-memory');
+    let error,outputs;
+    try {
+      const constants=p.constants.map(c=>{
+        const list=c.type.kind==='list',words=list?new Uint32Array(c.words.length+1):c.words;
+        if(list){words[0]=c.count;words.set(c.words,1);}
+        return {buffer:make(words.byteLength,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC,words),type:c.type,capacity:c.count};
+      });
+      for(const s of p.steps) {
+        const args=s.args.map(a=>a.kind==='step'?values[a.index]:constants[a.index]);
+        if(graphMode) {
+          const g=s.f.graph,cap=graphCapacity(g,args.map(a=>a.capacity)),nodes=[];
+          const resolve=ref=>Object.hasOwn(ref,'param')?args[ref.param]:nodes[ref.node];
+          for(const [i,n]of g.nodes.entries()) {
+            const count=cap.capacities[i],buffer=make((count*width(n.result)+(n.result.kind==='list'?1:0))*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC);
+            const pipe=pipelines.get(n.shader),inputs=n.args.map(resolve);
+            const group=device.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[...inputs.map((a,binding)=>({binding,resource:{buffer:a.buffer}})),{binding:inputs.length,resource:{buffer}}]});
+            stages.push({pipe,group,groups:n.ordered?1:Math.max(1,Math.ceil(count/n.workgroup_size))});nodes.push({buffer,type:n.result,capacity:count});
+          }
+          values.push(resolve(g.output));
+        } else {
+          const buffer=make((1+s.count*width(s.f.result))*4,GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC);
+          const metadata=make((s.args.length+1)*4,GPUBufferUsage.STORAGE,Uint32Array.from([...s.args.map(a=>a.count),s.count]));
+          const pipe=pipelines.get(s.f.shader),entries=args.map((a,binding)=>({binding,resource:{buffer:a.buffer}}));
+          entries.push({binding:args.length,resource:{buffer}},{binding:args.length+1,resource:{buffer:metadata}});
+          const group=device.createBindGroup({layout:pipe.getBindGroupLayout(0),entries});
+          stages.push({pipe,group,groups:s.count?Math.ceil(s.count/64):0});values.push({buffer,type:s.f.result,capacity:s.count});
+        }
+      }
+      outputs=p.outputs.map(id=>{
+        const v=values[p.ids.get(id)],list=v.type.kind==='list';
+        const bytes=graphMode?v.capacity*width(v.type)*4:(1+v.capacity*width(v.type))*4;
+        return {id,...v,list,header:graphMode&&list?make(4,GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST):null,read:make(bytes,GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST),readCapacity:bytes};
+      });
+    }catch(e){error=e;}
+    const oom=await device.popErrorScope(),validation=await device.popErrorScope();
+    if(error||oom||validation){for(const b of owned)b.destroy();fail(String(error??oom?.message??validation?.message));}
+    session={setup:Object.freeze({...setup}),async run(){
+      if(closed||lost)fail(closed?'prepared GPU call closed':'GPU device lost');
+      const counters={upload_bytes:0,readback_bytes:0,dispatches:0,live_buffer_bytes:live,resident:true};
+      device.pushErrorScope('validation');device.pushErrorScope('out-of-memory');let result,error;
+      const read=async(buffer,offset,bytes,target)=>{
+        if(!bytes)return new Uint32Array();
+        const encoder=device.createCommandEncoder();encoder.copyBufferToBuffer(buffer,offset,target,0,bytes);device.queue.submit([encoder.finish()]);
+        counters.readback_bytes+=bytes;await target.mapAsync(GPUMapMode.READ);
+        try{return new Uint32Array(target.getMappedRange(),0,bytes/4).slice();}finally{target.unmap();}
+      };
+      try {
+        const encoder=device.createCommandEncoder();
+        for(let iter=0;iter<p.iterations;iter++)for(const s of stages){if(!s.groups)continue;const pass=encoder.beginComputePass();pass.setPipeline(s.pipe);pass.setBindGroup(0,s.group);pass.dispatchWorkgroups(s.groups);pass.end();counters.dispatches++;}
+        device.queue.submit([encoder.finish()]);
+        const out={};
+        for(const v of outputs) {
+          if(graphMode) {
+            const count=v.list?(await read(v.buffer,0,4,v.header))[0]:1;if(count>v.capacity)fail('GPU graph length exceeds capacity');
+            const words=await read(v.buffer,v.list?4:0,count*width(v.type)*4,v.read);out[v.id]=unpack(words,v.type);
+          }else{
+            const words=await read(v.buffer,0,v.readCapacity,v.read),count=words[0];if(count*width(v.type)>words.length-1)fail('invalid GPU result length');
+            out[v.id]=unpack(words.subarray(1,1+count*width(v.type)),v.type);
+          }
+        }
+        if(lost)fail('GPU device lost');result={values:out,counters};
+      }catch(e){error=e;}
+      const oom=await device.popErrorScope(),validation=await device.popErrorScope();
+      if(error||oom||validation){release();fail(String(error??oom?.message??validation?.message));}
+      return result;
+    },close:release};sessions.add(session);return session;
+  }
+  return {prepare, capture, run:runGpu, close(){for(const session of [...sessions])session.close();device?.destroy();lost=true;gpuError="engine disposed";pipelines.clear();}};
 }
