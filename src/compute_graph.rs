@@ -63,47 +63,13 @@ fn free_vars(
     bound: &mut std::collections::BTreeSet<String>,
     out: &mut std::collections::BTreeSet<String>,
 ) {
-    match e {
-        Expr::Var(n) => {
-            if !bound.contains(n) {
-                out.insert(n.clone());
-            }
-        }
-        Expr::Lambda(n, b) => {
-            let mut local = bound.clone();
-            local.insert(n.clone());
-            free_vars(b, &mut local, out);
-        }
-        Expr::Let(n, _, x, b) => {
-            free_vars(x, bound, out);
-            let mut local = bound.clone();
-            local.insert(n.clone());
-            free_vars(b, &mut local, out);
-        }
-        Expr::Binary(_, a, b) => {
-            free_vars(a, bound, out);
-            free_vars(b, bound, out);
-        }
-        Expr::Call(_, a) => {
-            for x in a {
-                free_vars(x, bound, out)
-            }
-        }
-        Expr::Method(x, _, a) => {
-            free_vars(x, bound, out);
-            for x in a {
-                free_vars(x, bound, out)
-            }
-        }
-        Expr::Neg(x) | Expr::Field(x, _) | Expr::Try(x) => free_vars(x, bound, out),
-        Expr::Record(_, fs) => {
-            for (_, x) in fs {
-                free_vars(x, bound, out)
-            }
-        }
-        _ => {}
-    }
+    out.extend(
+        ink_core::analysis::free_variables(e)
+            .into_iter()
+            .filter(|n| !bound.contains(n)),
+    );
 }
+
 impl Graph<'_> {
     fn types(env: &GraphEnv) -> check::Env {
         env.iter().map(|(n, r)| (n.clone(), r.ty.clone())).collect()
@@ -559,7 +525,7 @@ pub(super) fn lower(
     let out = g.walk(&f.body, &env, Some(&f.result))?;
     // Full u64 arithmetic uses exact two-lane helpers in literal stages.
     Ok((
-        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"literal eager array stages; ordered sums forward, folds last-to-first; no reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","serial stable filter/scan/concat/ordered reductions","exact integer-lane binary32; canonical arithmetic NaN","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
+        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"literal eager array stages; ordered sums forward, foldr last-to-first and explicit fold_until forward with termination; no reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","serial stable filter/scan/concat/ordered reductions","exact integer-lane binary32; canonical arithmetic NaN","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
         g.shaders,
     ))
 }
