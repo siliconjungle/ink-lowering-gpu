@@ -26,7 +26,9 @@ pub fn needed(p: &Program) -> bool {
             _ => false,
         }
     }
-    ink_core::compute_values::needed(p)
+    ink_core::recursion::needed(p)
+        || ink_core::local_collections::needed(p)
+        || ink_core::compute_values::needed(p)
         || p.functions.iter().any(|f| {
             ordered(&f.body)
                 || (aggregate(&f.body)
@@ -47,6 +49,14 @@ fn wg(t: &Type) -> LangResult<String> {
         Type::Bool => "bool".into(),
         Type::Vector(t, n) => format!("vec{n}<{}>", wg(t)?),
         Type::Named(n) => format!("R_{n}"),
+        Type::Buffer(inner)
+            if matches!(
+                inner.as_ref(),
+                Type::U32 | Type::I32 | Type::F32 | Type::Bool
+            ) =>
+        {
+            format!("InkBuffer_{}", wg(inner)?)
+        }
         _ => {
             return Err("GPU scalar requires a 32-bit numeric, Bool, vector or flat record".into())
         }
@@ -327,6 +337,115 @@ impl Emitter<'_> {
                 ));
                 Ok(out)
             }
+            Expr::Call(n, a) if n == "buffer_fill" => {
+                let Type::Buffer(inner) = t else {
+                    unreachable!()
+                };
+                let Expr::Num(size) = a[0] else {
+                    return Err("GPU temporary buffers require literal capacity".into());
+                };
+                if size > 64 {
+                    return Err("GPU temporary buffer capacity exceeds 64 elements".into());
+                };
+                let value = self.scalar(&a[1], env, inner)?;
+                let value = self.bind(inner, &value)?;
+                let out = self.fresh();
+                let i = self.fresh();
+                self.line(format!("var {out}:{};{out}.length={size}u;for(var {i}=0u;{i}<{size}u;{i}++){{{out}.data[{i}]={value};}}",wg(t)?));
+                Ok(out)
+            }
+            Expr::Call(n, a) if n == "length" => self.length(&a[0], env),
+            Expr::Call(n, a) if n == "repeat_until" => {
+                let Expr::Num(limit) = a[0] else {
+                    return Err("GPU stopping loops require a literal limit".into());
+                };
+                if limit > 65536 {
+                    return Err("GPU stopping loop bound exceeds 65536".into());
+                };
+                let initial = self.scalar(&a[1], env, t)?;
+                let out = self.bind(t, &initial)?;
+                let i = self.fresh();
+                self.line(format!("for(var {i}=0u;{i}<{limit}u;{i}++){{"));
+                let stop = self.apply(&a[2], env, vec![(out.clone(), t.clone())], &Type::Bool)?;
+                self.line(format!("if({stop}){{break;}}"));
+                let step = self.apply(
+                    &a[3],
+                    env,
+                    vec![(i, Type::U32), (out.clone(), t.clone())],
+                    t,
+                )?;
+                self.line(format!("{out}={step};}}"));
+                Ok(out)
+            }
+            Expr::Method(xs, n, a)
+                if matches!(
+                    check::infer(xs, &Self::types(env), self.p)?,
+                    Type::Buffer(_)
+                ) =>
+            {
+                let xt = check::infer(xs, &Self::types(env), self.p)?;
+                let Type::Buffer(inner) = &xt else {
+                    unreachable!()
+                };
+                let b = self.scalar(xs, env, &xt)?;
+                if n == "len" {
+                    return Ok(format!("{b}.length"));
+                }
+                if n == "pop" {
+                    self.line(format!("if({b}.length>0u){{{b}.length--;}}"));
+                    return Ok(b);
+                }
+                if n == "map_parallel" {
+                    self.scalar(&a[0], env, &Type::U32)?;
+                    let i = self.fresh();
+                    self.line(format!("for(var {i}=0u;{i}<{b}.length;{i}++){{"));
+                    let value = self.apply(
+                        &a[1],
+                        env,
+                        vec![
+                            (i.clone(), Type::U32),
+                            (format!("{b}.data[{i}]"), *inner.clone()),
+                        ],
+                        inner,
+                    )?;
+                    self.line(format!("{b}.data[{i}]={value};}}"));
+                    return Ok(b);
+                }
+                if !["at_or", "set", "swap", "truncate"].contains(&n.as_str()) {
+                    return Err("GPU temporary method uses CPU fallback".into());
+                };
+                let i = self.scalar(&a[0], env, &Type::U32)?;
+                let i = self.bind(&Type::U32, &i)?;
+                match n.as_str() {
+                    "at_or" => {
+                        let out = self.fresh();
+                        self.line(format!(
+                            "var {out}:{};if({i}<{b}.length){{{out}={b}.data[{i}];}}else{{",
+                            wg(inner)?
+                        ));
+                        let value = self.scalar(&a[1], env, inner)?;
+                        self.line(format!("{out}={value};}}"));
+                        Ok(out)
+                    }
+                    "set" => {
+                        let value = self.scalar(&a[1], env, inner)?;
+                        self.line(format!("if({i}<{b}.length){{{b}.data[{i}]={value};}}"));
+                        Ok(b)
+                    }
+                    "swap" => {
+                        let j = self.scalar(&a[1], env, &Type::U32)?;
+                        let j = self.bind(&Type::U32, &j)?;
+                        let tmp = self.fresh();
+                        self.line(format!("if({i}<{b}.length&&{j}<{b}.length){{let {tmp}={b}.data[{i}];{b}.data[{i}]={b}.data[{j}];{b}.data[{j}]={tmp};}}"));
+                        Ok(b)
+                    }
+                    "truncate" => {
+                        self.line(format!("{b}.length=min({b}.length,{i});"));
+                        Ok(b)
+                    }
+                    _ => unreachable!(),
+                }
+            }
             Expr::Method(xs, n, a) if n == "at_or" => {
                 let idx = self.scalar(&a[0], env, &Type::U32)?;
                 let idx = self.bind(&Type::U32, &idx)?;
@@ -481,6 +600,7 @@ impl Emitter<'_> {
                     BTreeMap::from([("ink_repeat_value".into(), (v, t))]),
                 )))
             }
+            Expr::Call(n, args) if n == "parallel_map" => Ok(None),
             Expr::Call(n, args) if n == "choose" => Ok(None),
             Expr::Call(n, args) => {
                 let f = self
@@ -515,6 +635,12 @@ impl Emitter<'_> {
         r
     }
     fn length_inner(&mut self, e: &Expr, env: &Env) -> LangResult<String> {
+        if let Expr::Call(n, a) = e {
+            if n == "parallel_map" {
+                self.scalar(&a[1], env, &Type::U32)?;
+                return self.length(&a[0], env);
+            }
+        }
         if let Some((e, env)) = self.with_list_body(e, env)? {
             return self.length(&e, &env);
         }
@@ -566,6 +692,23 @@ impl Emitter<'_> {
         r
     }
     fn element_inner(&mut self, e: &Expr, index: &str, env: &Env) -> LangResult<String> {
+        if let Expr::Call(n, a) = e {
+            if n == "parallel_map" {
+                let Type::List(input) = check::infer(&a[0], &Self::types(env), self.p)? else {
+                    unreachable!()
+                };
+                let Type::List(output) = check::infer(e, &Self::types(env), self.p)? else {
+                    unreachable!()
+                };
+                let v = self.element(&a[0], index, env)?;
+                return self.apply(
+                    &a[2],
+                    env,
+                    vec![(index.into(), Type::U32), (v, *input)],
+                    &output,
+                );
+            }
+        }
         if self.budget == 0 {
             return Err("GPU collection emission budget".into());
         }
@@ -673,6 +816,11 @@ impl Emitter<'_> {
         r
     }
     fn bound_slots_inner(&mut self, e: &Expr, env: &Env) -> LangResult<Vec<usize>> {
+        if let Expr::Call(n, a) = e {
+            if n == "parallel_map" {
+                return self.bound_slots(&a[0], env);
+            }
+        }
         if let Some((e, env)) = self.with_list_body(e, env)? {
             return self.bound_slots(&e, &env);
         }
@@ -771,6 +919,11 @@ fn store(t: &Type, value: &str, base: &str, off: &mut usize, p: &Program) -> Lan
 }
 fn types(p: &Program, _gpu: bool) -> LangResult<String> {
     let mut out = String::new();
+    for t in ["u32", "i32", "f32", "bool"] {
+        out.push_str(&format!(
+            "struct InkBuffer_{t}{{data:array<{t},64>,length:u32,}}\n"
+        ));
+    }
     for (n, fields) in &p.records {
         out.push_str(&format!("struct R_{n}{{"));
         for (n, t) in fields {
