@@ -28,3 +28,11 @@ All targets consume [ink-abi](https://github.com/siliconjungle/ink-abi) for shar
 type/layout contracts. Early termination, owned-buffer transforms and helper
 unfolding are checked database choices. The backend emits the resulting general
 operations literally; it does not infer those transformations from source patterns.
+
+
+Legacy browser readback strips its internal list header with a subview of the
+already-owned host word buffer before decoding. The initial mapped-to-owned
+readback copy and the public owned result remain required. Complete and prepared
+results survive readback unmap, caller mutation, subsequent runs and close; this
+does not expose a borrowed device view or claim zero-copy public outputs. Run
+`node tests/device_graph.mjs` for poison-on-unmap and retained-output coverage.

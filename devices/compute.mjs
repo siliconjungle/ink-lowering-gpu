@@ -299,7 +299,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
         const words=new Uint32Array(b.getMappedRange(),0,bytes/4).slice();
         const type=p.steps[p.ids.get(id)].f.result, count=words[0];
         if(count*width(type)>words.length-1)fail("invalid GPU result length");
-        values[id]=unpack(words.slice(1,1+count*width(type)),type);
+        values[id]=unpack(words.subarray(1,1+count*width(type)),type);
         b.unmap();
       }
       result = {
@@ -404,7 +404,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
             const words=await read(v.buffer,v.list?4:0,count*width(v.type)*4,v.read);out[v.id]=unpack(words,v.type);
           }else{
             const words=await read(v.buffer,0,v.readCapacity,v.read),count=words[0];if(count*width(v.type)>words.length-1)fail('invalid GPU result length');
-            out[v.id]=unpack(words.slice(1,1+count*width(v.type)),v.type);
+            out[v.id]=unpack(words.subarray(1,1+count*width(v.type)),v.type);
           }
         }
         if(lost)fail('GPU device lost');result={values:out,counters};
