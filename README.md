@@ -15,4 +15,19 @@ Eligible flat 32-bit array kernels include composed map/filter/zip, inclusive in
 
 When literal collection work has a supported stage graph, emission selects that eager graph rather than a quadratic per-output direct traversal. Unsupported graph forms can retain the bounded direct shader path; direct list transport uses `ink-gpu-list-v3` headers.
 
+Packed browser device adapters additionally support fixed-input `capture(plan)`
+sessions owned by the runtime host. Active required graphs and legacy shaders
+reuse input/stage/readback buffers. Setup reports one upload; repeated runs
+report actual dispatch/readback/live counters and zero upload. Dynamic list
+lengths stay in headers. No feedback or public mutable device handle is exposed.
+Host-owned serialization and close/device-loss boundaries remain explicit.
+
 Private scalar buffers use fixed capacity 64, with bounded construction/push, split/rejoin, mapping and stopping loops. Complementary split provenance bounds dynamic rejoining; growing loop bounds and oversized independent appends explicitly fall back. See `tests/temporary_bounds.rs` and `tests/device_graph.mjs`.
+
+
+Legacy browser readback strips its internal list header with a subview of the
+already-owned host word buffer before decoding. The initial mapped-to-owned
+readback copy and the public owned result remain required. Complete and prepared
+results survive readback unmap, caller mutation, subsequent runs and close; this
+does not expose a borrowed device view or claim zero-copy public outputs. Run
+`node tests/device_graph.mjs` for poison-on-unmap and retained-output coverage.
