@@ -4,10 +4,18 @@ use crate::{check, core, syntax::*, LangResult};
 /// Target-owned packed ABI classification for literal ordered stage graphs.
 /// The semantic core's value classification stays unchanged.
 pub fn needed(p: &Program) -> bool {
+    fn full_width(t: &Type) -> bool {
+        match t {
+            Type::U64 => true,
+            Type::List(t) | Type::Option(t) => full_width(t),
+            _ => false,
+        }
+    }
     fn aggregate(e: &Expr) -> bool {
         match e {
             Expr::Call(n, a) => {
-                ["sum", "count", "foldr"].contains(&n.as_str()) || a.iter().any(aggregate)
+                ["sum", "count", "foldr", "fold_until"].contains(&n.as_str())
+                    || a.iter().any(aggregate)
             }
             Expr::Binary(_, a, b) | Expr::Let(_, _, a, b) => aggregate(a) || aggregate(b),
             Expr::Method(x, _, a) => aggregate(x) || a.iter().any(aggregate),
@@ -18,7 +26,7 @@ pub fn needed(p: &Program) -> bool {
     }
     fn ordered(e: &Expr) -> bool {
         match e {
-            Expr::Call(n, a) => n == "foldr" || a.iter().any(ordered),
+            Expr::Call(n, a) => (n == "foldr" || n == "fold_until") || a.iter().any(ordered),
             Expr::Binary(_, a, b) | Expr::Let(_, _, a, b) => ordered(a) || ordered(b),
             Expr::Method(x, _, a) => ordered(x) || a.iter().any(ordered),
             Expr::Lambda(_, x) | Expr::Neg(x) | Expr::Field(x, _) => ordered(x),
@@ -27,6 +35,9 @@ pub fn needed(p: &Program) -> bool {
         }
     }
     ink_core::recursion::needed(p)
+        || p.functions
+            .iter()
+            .any(|f| full_width(&f.result) || f.params.iter().any(|(_, t)| full_width(t)))
         || ink_core::local_collections::needed(p)
         || ink_core::compute_values::needed(p)
         || p.functions.iter().any(|f| {
@@ -44,15 +55,16 @@ mod graph;
 fn wg(t: &Type) -> LangResult<String> {
     Ok(match t {
         Type::U32 => "u32".into(),
+        Type::U64 => "InkU64".into(),
         Type::I32 => "i32".into(),
-        Type::F32 => "f32".into(),
+        Type::F32 => "u32".into(),
         Type::Bool => "bool".into(),
         Type::Vector(t, n) => format!("vec{n}<{}>", wg(t)?),
         Type::Named(n) => format!("R_{n}"),
         Type::Buffer(inner)
             if matches!(
                 inner.as_ref(),
-                Type::U32 | Type::I32 | Type::F32 | Type::Bool
+                Type::U32 | Type::U64 | Type::I32 | Type::F32 | Type::Bool
             ) =>
         {
             format!("InkBuffer_{}", wg(inner)?)
@@ -63,48 +75,12 @@ fn wg(t: &Type) -> LangResult<String> {
     })
 }
 fn desc(t: &Type, p: &Program) -> LangResult<Value> {
-    desc_inner(t, p, 0)
+    ink_abi::describe(t, &p.records, &p.enums, &p.ids)
 }
-fn desc_inner(t: &Type, p: &Program, depth: usize) -> LangResult<Value> {
-    if depth > 32 {
-        return Err("packed value type depth exceeded".into());
-    }
-    Ok(match t {
-        Type::List(t) => json!({"kind":"list","element":desc_inner(t,p,depth+1)?}),
-        Type::Vector(t, n) => json!({"kind":"vector","element":desc_inner(t,p,depth+1)?,"size":n}),
-        Type::Named(n) => {
-            json!({"kind":"record","name":n,"fields":p.records.get(n).ok_or("unknown record")?.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc_inner(t,p,depth+1)?}))).collect::<LangResult<Vec<_>>>()?})
-        }
-        Type::U32 => json!({"kind":"u32"}),
-        Type::U64 => json!({"kind":"u64"}),
-        Type::I32 => json!({"kind":"i32"}),
-        Type::F32 => json!({"kind":"f32"}),
-        Type::Bool => json!({"kind":"bool"}),
-        _ => return Err("unsupported compute ABI".into()),
-    })
+fn lanes(t: &Type, p: &Program, _gpu: bool) -> LangResult<usize> {
+    ink_abi::flat_width(&ink_abi::describe(t, &p.records, &p.enums, &p.ids)?)
 }
-fn lanes(t: &Type, p: &Program, gpu: bool) -> LangResult<usize> {
-    lanes_inner(t, p, gpu, 0)
-}
-fn lanes_inner(t: &Type, p: &Program, gpu: bool, depth: usize) -> LangResult<usize> {
-    if depth > 32 {
-        return Err("packed value type depth exceeded".into());
-    }
-    match t {
-        Type::U32 | Type::I32 | Type::F32 | Type::Bool => Ok(1),
-        Type::U64 if !gpu => Ok(2),
-        Type::Vector(t, n) => Ok(lanes_inner(t, p, gpu, depth + 1)? * (*n as usize)),
-        Type::Named(n) => p
-            .records
-            .get(n)
-            .ok_or("unknown record")?
-            .iter()
-            .try_fold(0, |a, (_, t)| Ok(a + lanes_inner(t, p, gpu, depth + 1)?)),
-        _ => {
-            Err("packed compute values must be flat; GPU values use only 32-bit components".into())
-        }
-    }
-}
+
 // Upper length bounds follow owners through literal emission. Complementary
 // partitions retain their common origin, so rejoining even dynamically split
 // halves stays bounded by the original length. This is emission eligibility,
@@ -144,7 +120,6 @@ struct Emitter<'a> {
     next: usize,
     budget: usize,
     depth: usize,
-    graph: bool,
     views: Vec<(Expr, Env)>,
     buffers: BTreeMap<String, BufferBound>,
 }
@@ -204,6 +179,52 @@ impl Emitter<'_> {
         Ok(())
     }
     fn add(&self, op: &str, a: &str, b: &str, t: &Type) -> String {
+        if let Type::Vector(inner, n) = t {
+            if **inner == Type::F32 {
+                return format!(
+                    "vec{n}<u32>({})",
+                    ["x", "y", "z", "w"]
+                        .iter()
+                        .take(*n as usize)
+                        .map(|field| self.add(
+                            op,
+                            &format!("({a}).{field}"),
+                            &format!("({b}).{field}"),
+                            inner
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+        if *t == Type::F32 {
+            return match op {
+                "+" => format!("ink_f32_add({a},{b})"),
+                "-" => format!("ink_f32_sub({a},{b})"),
+                "*" => format!("ink_f32_mul({a},{b})"),
+                "==" => format!("ink_f32_eq({a},{b})"),
+                "!=" => format!("!ink_f32_eq({a},{b})"),
+                "<" => format!("ink_f32_lt({a},{b})"),
+                "<=" => format!("(ink_f32_lt({a},{b})||ink_f32_eq({a},{b}))"),
+                ">" => format!("ink_f32_lt({b},{a})"),
+                ">=" => format!("(ink_f32_lt({b},{a})||ink_f32_eq({a},{b}))"),
+                _ => unreachable!("checked f32 operation"),
+            };
+        }
+        if *t == Type::U64 {
+            return match op {
+                "+" => format!("ink_u64_add({a},{b})"),
+                "-" => format!("ink_u64_sub({a},{b})"),
+                "*" => format!("ink_u64_mul({a},{b})"),
+                "==" => format!("ink_u64_eq({a},{b})"),
+                "!=" => format!("!ink_u64_eq({a},{b})"),
+                "<" => format!("ink_u64_lt({a},{b})"),
+                "<=" => format!("!ink_u64_lt({b},{a})"),
+                ">" => format!("ink_u64_lt({b},{a})"),
+                ">=" => format!("!ink_u64_lt({a},{b})"),
+                _ => unreachable!("checked u64 operation"),
+            };
+        }
         if *t == Type::I32 && ["+", "-", "*"].contains(&op) {
             {
                 format!("bitcast<i32>(bitcast<u32>({a}) {op} bitcast<u32>({b}))")
@@ -233,13 +254,13 @@ impl Emitter<'_> {
         match e {
             Expr::Num(n) => Ok(match t {
                 Type::F32 => {
-                    format!("{n}.0f")
+                    format!("{}u", (*n as f32).to_bits())
                 }
                 Type::I32 => format!("{n}{}", { "i" }),
-                Type::U64 => return Err("GPU scalar u64 is unsupported".into()),
+                Type::U64 => format!("InkU64({}u,{}u)", *n as u32, (*n >> 32) as u32),
                 _ => format!("{n}u"),
             }),
-            Expr::Float(bits) => Ok(format!("bitcast<f32>({bits}u)")),
+            Expr::Float(bits) => Ok(format!("{bits}u")),
             Expr::Bool(b) => Ok(b.to_string()),
             Expr::Var(n) => env
                 .get(n)
@@ -256,6 +277,10 @@ impl Emitter<'_> {
                 let a = self.scalar(x, env, t)?;
                 Ok(if *t == Type::I32 {
                     self.add("-", "0", &a, t)
+                } else if *t == Type::U64 {
+                    format!("ink_u64_sub(InkU64(0u,0u),{a})")
+                } else if *t == Type::F32 {
+                    format!("(({a}) ^ 0x80000000u)")
                 } else if *t == Type::U32 {
                     format!("(0u - ({a}))")
                 } else {
@@ -408,11 +433,27 @@ impl Emitter<'_> {
                 } else {
                     String::new()
                 };
-                self.line(format!("if ({y}==0{overflow}) {{"));
+                let zero = if *t == Type::U64 {
+                    format!("ink_u64_eq({y},InkU64(0u,0u))")
+                } else {
+                    format!("{y}==0{overflow}")
+                };
+                self.line(format!("if ({zero}) {{"));
                 let fallback = self.scalar(&a[2], env, t)?;
+                let division = if *t == Type::U64 {
+                    format!(
+                        "ink_u64_div({x},{y}).{}",
+                        if n == "quot_or" {
+                            "quotient"
+                        } else {
+                            "remainder"
+                        }
+                    )
+                } else {
+                    format!("{x} {} {y}", if n == "quot_or" { "/" } else { "%" })
+                };
                 self.line(format!(
-                    "{out}={fallback};\n}} else {{ {out}={x} {} {y}; }}",
-                    if n == "quot_or" { "/" } else { "%" }
+                    "{out}={fallback};\n}} else {{ {out}={division}; }}"
                 ));
                 Ok(out)
             }
@@ -539,6 +580,46 @@ impl Emitter<'_> {
                     self.buffers.insert(b.clone(), BufferBound::Fixed(upper));
                     return Ok(b);
                 }
+                if n == "filter" {
+                    let i = self.fresh();
+                    let kept = self.fresh();
+                    self.line(format!(
+                        "var {kept}=0u;for(var {i}=0u;{i}<{b}.length;{i}++){{"
+                    ));
+                    let item = self.bind(inner, &format!("{b}.data[{i}]"))?;
+                    let pred = self.apply(
+                        &a[0],
+                        env,
+                        vec![(item.clone(), *inner.clone())],
+                        &Type::Bool,
+                    )?;
+                    self.line(format!(
+                        "if({pred}){{{b}.data[{kept}]={item};{kept}++;}}}}{b}.length={kept};"
+                    ));
+                    return Ok(b);
+                }
+                if ["map", "map_indexed", "scan"].contains(&n.as_str()) {
+                    let i = self.fresh();
+                    let acc = self.fresh();
+                    if n == "scan" {
+                        self.line(format!("var {acc}:{}=0;", self.ty(inner)?));
+                    }
+                    self.line(format!("for(var {i}=0u;{i}<{b}.length;{i}++){{"));
+                    let item = format!("{b}.data[{i}]");
+                    let value = if n == "scan" {
+                        self.line(format!("{acc}={acc}+{item};"));
+                        acc
+                    } else {
+                        let params = if n == "map" {
+                            vec![(item, *inner.clone())]
+                        } else {
+                            vec![(i.clone(), Type::U32), (item, *inner.clone())]
+                        };
+                        self.apply(&a[0], env, params, inner)?
+                    };
+                    self.line(format!("{b}.data[{i}]={value};}}"));
+                    return Ok(b);
+                }
                 if n == "map_parallel" {
                     self.scalar(&a[0], env, &Type::U32)?;
                     let i = self.fresh();
@@ -602,14 +683,33 @@ impl Emitter<'_> {
                 self.line(format!("{out}={v};}}"));
                 Ok(out)
             }
+            Expr::Call(n, a) if n == "fold_until" => {
+                let len = self.length(&a[0], env)?;
+                let initial = self.scalar(&a[1], env, t)?;
+                let out = self.bind(t, &initial)?;
+                let i = self.fresh();
+                self.line(format!("for(var {i}=0u;{i}<{len};{i}++){{"));
+                let item = self.element(&a[0], &i, env)?;
+                let Type::List(inner) = check::infer(&a[0], &Self::types(env), self.p)? else {
+                    return Err("fold input".into());
+                };
+                let values = vec![(item, *inner), (out.clone(), t.clone())];
+                let stop = self.apply(&a[2], env, values.clone(), &Type::Bool)?;
+                let stop = self.bind(&Type::Bool, &stop)?;
+                let value = self.apply(&a[3], env, values, t)?;
+                self.line(format!("{out}={value};if({stop}){{break;}}}}"));
+                Ok(out)
+            }
             Expr::Call(n, a) if n == "count" => self.length(&a[0], env),
             Expr::Call(n, a) if n == "sum" || n == "foldr" => {
                 let len = self.length(&a[0], env)?;
                 let init = if n == "sum" {
                     if *t == Type::F32 {
-                        "0.0".into()
+                        "0u".into()
                     } else if *t == Type::I32 {
                         "0i".into()
+                    } else if *t == Type::U64 {
+                        "InkU64(0u,0u)".into()
                     } else {
                         "0u".into()
                     }
@@ -886,7 +986,9 @@ impl Emitter<'_> {
                     let out = self.bind(
                         &et,
                         if *et == Type::F32 {
-                            "0.0"
+                            "0u"
+                        } else if *et == Type::U64 {
+                            "InkU64(0u,0u)"
                         } else if *et == Type::I32 {
                             "0i"
                         } else {
@@ -928,7 +1030,9 @@ impl Emitter<'_> {
                     self.line(format!("for(var {j}=0u;{j}<{len};{j}++){{"));
                     let other = self.element(xs, &j, env)?;
                     let other = self.bind(&et, &other)?;
-                    self.line(format!("if({other}<{v}||({other}=={v}&&{j}<{i})){{{rank}++;}}}}if({rank}=={index}){{{out}={v};break;}}}}"));
+                    let less = self.add("<", &other, &v, &et);
+                    let equal = self.add("==", &other, &v, &et);
+                    self.line(format!("if({less}||({equal}&&{j}<{i})){{{rank}++;}}}}if({rank}=={index}){{{out}={v};break;}}}}"));
                     return Ok(out);
                 }
                 let v = self.element(xs, index, env)?;
@@ -1002,10 +1106,15 @@ fn load(t: &Type, buf: &str, index: &str, p: &Program) -> LangResult<String> {
                 *offset += 1;
                 let x = format!("{buf}[{base}+{n}u]");
                 match t {
-                    Type::U32 => x,
+                    Type::U32 | Type::F32 => x,
                     Type::Bool => format!("({x}!=0u)"),
                     _ => format!("bitcast<{}>({x})", wg(t)?),
                 }
+            }
+            Type::U64 => {
+                let n = *offset;
+                *offset += 2;
+                format!("InkU64({buf}[{base}+{n}u],{buf}[{base}+{}u])", n + 1)
             }
             Type::Vector(et, n) => {
                 let a = (0..*n)
@@ -1041,6 +1150,14 @@ fn store(t: &Type, value: &str, base: &str, off: &mut usize, p: &Program) -> Lan
             };
             format!("output[{base}+{n}u]={v};\n")
         }
+        Type::U64 => {
+            let n = *off;
+            *off += 2;
+            format!(
+                "output[{base}+{n}u]=({value}).lo;output[{base}+{}u]=({value}).hi;\n",
+                n + 1
+            )
+        }
         Type::Vector(et, n) => (0..*n)
             .map(|i| {
                 store(
@@ -1062,8 +1179,9 @@ fn store(t: &Type, value: &str, base: &str, off: &mut usize, p: &Program) -> Lan
     })
 }
 fn types(p: &Program, _gpu: bool) -> LangResult<String> {
-    let mut out = String::new();
-    for t in ["u32", "i32", "f32", "bool"] {
+    let mut out = include_str!("u64.wgsl").to_owned();
+    out.push_str(include_str!("f32.wgsl"));
+    for t in ["u32", "InkU64", "i32", "bool"] {
         out.push_str(&format!(
             "struct InkBuffer_{t}{{data:array<{t},64>,length:u32,}}\n"
         ));
@@ -1116,7 +1234,6 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
         next: 0,
         budget: 100000,
         depth: 0,
-        graph: false,
         views: vec![],
         buffers: BTreeMap::new(),
     };
@@ -1193,7 +1310,7 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
         functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"graph":graph,"graph_required":required,"capacity_mode":"max","gpu_max_elements":if !required && heavy(&f.body,p,&mut std::collections::BTreeSet::new()){Some(128)}else{None},"fallback_reason":reason}));
     }
     use sha2::{Digest, Sha256};
-    let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; GPU lists carry a length header; records in declaration order; vectors unpadded","gpu_list_abi":"ink-gpu-list-v3","collection_strategy":"literal per-output evaluation; filters, ordered scans and stable rank sorts may do quadratic or greater work; profitability must be measured","float_contract":"portable f32 follows WGSL permitted floating evaluation, including rounding, reassociation, fusion, flush-to-zero and finite-math assumptions; lowering emits source order; CPU reference uses binary32; bitwise equivalence is not promised","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; profiling establishes profitability only"});
+    let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; GPU lists carry a length header; records in declaration order; vectors unpadded","gpu_list_abi":"ink-gpu-list-v3","collection_strategy":"literal per-output evaluation; filters, ordered scans and stable rank sorts may do quadratic or greater work; profitability must be measured","float_contract":"integer-lane binary32; round-to-nearest ties-to-even, gradual underflow, signed zero, source operation order and canonical arithmetic NaN; pass-through/negation retain payload bits","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; saved profiles estimate profitability only"});
     Ok(crate::gpu::Emission {
         manifest,
         shaders: files,
