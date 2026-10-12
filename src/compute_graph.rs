@@ -35,7 +35,7 @@ fn has_collection(e: &Expr, p: &Program) -> bool {
     match e {
         Expr::Method(..) => true,
         Expr::Call(n, a) => {
-            ["sum", "count", "foldr"].contains(&n.as_str())
+            ["sum", "count", "foldr", "foldl"].contains(&n.as_str())
                 || p.functions.iter().any(|f| {
                     &f.name == n && (matches!(f.result, Type::List(_)) || contains_method(&f.body))
                 })
@@ -53,7 +53,7 @@ fn contains_method(e: &Expr) -> bool {
     match e {
         Expr::Method(..) => true,
         Expr::Call(n, a) => {
-            ["sum", "count", "foldr"].contains(&n.as_str()) || a.iter().any(contains_method)
+            ["sum", "count", "foldr", "foldl"].contains(&n.as_str()) || a.iter().any(contains_method)
         }
         Expr::Let(_, _, x, b) | Expr::Binary(_, x, b) => contains_method(x) || contains_method(b),
         Expr::Neg(x) | Expr::Field(x, _) | Expr::Lambda(_, x) => contains_method(x),
@@ -118,7 +118,7 @@ impl Graph<'_> {
                 }
                 return self.walk(&f.body, &local, Some(&f.result));
             }
-            if ["sum", "count", "foldr"].contains(&n.as_str()) {
+            if ["sum", "count", "foldr", "foldl"].contains(&n.as_str()) {
                 let list_ty = if n == "sum" {
                     Some(Type::List(Box::new(ty.clone())))
                 } else {
@@ -128,7 +128,7 @@ impl Graph<'_> {
                 let mut local = env.clone();
                 self.alias(src.clone(), &mut local);
                 let mut initial = None;
-                if n == "foldr" {
+                if n == "foldr" || n == "foldl" {
                     let r = self.walk(&args[1], env, Some(&ty))?;
                     initial = Some(self.alias(r, &mut local));
                 }
@@ -198,7 +198,7 @@ impl Graph<'_> {
                 Ok(self.alias(r, env))
             }
             Expr::Call(n, _)
-                if ["sum", "count", "foldr"].contains(&n.as_str())
+                if ["sum", "count", "foldr", "foldl"].contains(&n.as_str())
                     || self.p.functions.iter().any(|f| &f.name == n) =>
             {
                 let r = self.walk(e, env, Some(&ty))?;
@@ -412,7 +412,7 @@ impl Graph<'_> {
             return Ok(r);
         }
         let serial = [
-            "filter", "scan", "concat", "sum", "count", "foldr", "scalar",
+            "filter", "scan", "concat", "sum", "count", "foldr", "foldl", "scalar",
         ]
         .contains(&op);
         let src = slots.first().map(|i| format!("a{i}"));
@@ -515,7 +515,7 @@ impl Graph<'_> {
                 em.line(format!("acc={};", em.add("+", "acc", &v, et)));
             }
             "count" => {}
-            "foldr" => {
+            "foldr" | "foldl" => {
                 let Expr::Lambda(x, b) = callback.ok_or("fold callback missing")? else {
                     return Err("fold lambda missing".into());
                 };
@@ -555,6 +555,7 @@ impl Graph<'_> {
             "filter"=>format!("if(gid.x!=0u){{return;}}var used=0u;for(var i=0u;i<{};i++){{\n{}\n}}output[0]=used;",len.unwrap(),em.lines),
             "concat"=>{let second=load_list(et,&format!("a{}",slots[1]),"i",self.p)?;format!("if(gid.x!=0u){{return;}}let n={};output[0]=n+a{}[0];for(var i=0u;i<n;i++){{{}}}for(var i=0u;i<a{}[0];i++){{{}}}",len.unwrap(),slots[1],em.lines,slots[1],store(et,&second,&format!("1u+(n+i)*{}u",lanes(et,self.p,true)?),&mut 0,self.p)?)},
             "sum"|"scan"=>format!("if(gid.x!=0u){{return;}}var acc:{}={};{}for(var i=0u;i<{};i++){{\n{}\n}}{}",wg(et)?,if *et==Type::F32{"0u"}else if *et==Type::U64{"InkU64(0u,0u)"}else if *et==Type::I32{"0i"}else{"0u"},if op=="scan"{format!("output[0]={};",len.as_ref().unwrap())}else{String::new()},len.unwrap(),em.lines,if op=="sum"{store(ty,"acc","0u",&mut 0,self.p)?}else{String::new()}),
+            "foldl"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,views:vec![],buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};for(var i=0u;i<{};i++){{\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
             "foldr"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,views:vec![],buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};var cursor={};loop{{if(cursor==0u){{break;}}cursor--;let i=cursor;\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
             "count"=>format!("if(gid.x!=0u){{return;}}output[0]={};output[1]=0u;",len.unwrap()),
             _=>format!("if(gid.x!=0u){{return;}}{}",em.lines)
@@ -606,7 +607,7 @@ pub(super) fn lower(
     let out = g.walk(&f.body, &env, Some(&f.result))?;
     // Full u64 arithmetic uses exact two-lane helpers in literal stages.
     Ok((
-        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"eager array stages; integer scans/sums (exactly wrapping), stable filters, integer radix sorts and concatenation run as parallel multi-pass schedules; float scans/sums, foldr and fold_until keep their ordered serial stage; no float reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","parallel schedules support capacities up to 256^3 elements","ordered float reductions and folds run serially","exact integer-lane binary32; canonical arithmetic NaN","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
+        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"eager array stages; integer scans/sums (exactly wrapping), stable filters, integer radix sorts and concatenation run as parallel multi-pass schedules; float scans/sums, foldr, foldl and fold_until keep their ordered serial stage; no float reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","parallel schedules support capacities up to 256^3 elements","ordered float reductions and folds run serially","exact integer-lane binary32; canonical arithmetic NaN","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
         g.shaders,
     ))
 }

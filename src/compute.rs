@@ -14,7 +14,7 @@ pub fn needed(p: &Program) -> bool {
     fn aggregate(e: &Expr) -> bool {
         match e {
             Expr::Call(n, a) => {
-                ["sum", "count", "foldr", "fold_until"].contains(&n.as_str())
+                ["sum", "count", "foldr", "foldl", "fold_until"].contains(&n.as_str())
                     || a.iter().any(aggregate)
             }
             Expr::Binary(_, a, b) | Expr::Let(_, _, a, b) => aggregate(a) || aggregate(b),
@@ -26,7 +26,7 @@ pub fn needed(p: &Program) -> bool {
     }
     fn ordered(e: &Expr) -> bool {
         match e {
-            Expr::Call(n, a) => (n == "foldr" || n == "fold_until") || a.iter().any(ordered),
+            Expr::Call(n, a) => (n == "foldr" || n == "foldl" || n == "fold_until") || a.iter().any(ordered),
             Expr::Binary(_, a, b) | Expr::Let(_, _, a, b) => ordered(a) || ordered(b),
             Expr::Method(x, _, a) => ordered(x) || a.iter().any(ordered),
             Expr::Lambda(_, x) | Expr::Neg(x) | Expr::Field(x, _) => ordered(x),
@@ -703,7 +703,7 @@ impl Emitter<'_> {
                 Ok(out)
             }
             Expr::Call(n, a) if n == "count" => self.length(&a[0], env),
-            Expr::Call(n, a) if n == "sum" || n == "foldr" => {
+            Expr::Call(n, a) if n == "sum" || n == "foldr" || n == "foldl" => {
                 let len = self.length(&a[0], env)?;
                 let init = if n == "sum" {
                     if *t == Type::F32 {
@@ -720,7 +720,7 @@ impl Emitter<'_> {
                 };
                 let out = self.bind(t, &init)?;
                 let i = self.fresh();
-                self.line(if n == "sum" {
+                self.line(if n == "sum" || n == "foldl" {
                     format!("for(var {i}=0u;{i}<{len};{i}++){{")
                 } else {
                     format!("for(var {i}={len};{i}>0u;){{{i}--; ")
