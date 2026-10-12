@@ -279,7 +279,7 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<Emission> {
             }
             Err(reason) => (Value::Null, json!(reason)),
         };
-        functions.push(json!({"name":f.name,"index":index,"params":params,"result":kind(&f.result)?,"gpu":gpu,"cpu_reason":reason}));
+        functions.push(json!({"name":f.name,"index":index,"precondition":p.contracts.precondition_checks.get(&f.name).map(|name|json!({"name":name,"index":p.functions.iter().position(|g|&g.name==name).unwrap(),"result":"bool","params":params})),"params":params,"result":kind(&f.result)?,"gpu":gpu,"cpu_reason":reason}));
     }
     files.extend([
         (
@@ -299,7 +299,7 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<Emission> {
             include_str!("../shaders/gpu-filter-scatter.wgsl").into(),
         ),
     ]);
-    let manifest = json!({"schema":1,"backend":"webgpu-wgpu-v1","core_semantics":core::SEMANTICS,"core_sha256":checked.identity()?,"functions":functions,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"trust":["Rust type checker","literal C and WGSL lowering","parallel u32 sum and stable filter primitives","C/LLVM and wgpu/WebGPU shader toolchains and drivers","host ABI and runtime"],"proof_claim":"no GPU backend or shader correctness proof; no new optimisation laws; literal source stages retained","selection":"shared ink-abi decision contract over saved target profiles; no runtime trials","limitations":["GPU subset: u32 map/filter followed by sum/count, one list and u32/Bool scalars","u64, exact integers, nested collections, order-sensitive folds and transactions remain on CPU","GPU unavailable, device loss, limits or validation errors fall back to compiled CPU","no universal performance or all-device GPU guarantee"]});
+    let manifest = json!({"schema":1,"backend":"webgpu-wgpu-v1","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"functions":functions,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"trust":["Rust type checker","literal C and WGSL lowering","parallel u32 sum and stable filter primitives","C/LLVM and wgpu/WebGPU shader toolchains and drivers","host ABI and runtime"],"proof_claim":"no GPU backend or shader correctness proof; no new optimisation laws; literal source stages retained","selection":"shared ink-abi decision contract over saved target profiles; no runtime trials","limitations":["GPU subset: u32 map/filter followed by sum/count, one list and u32/Bool scalars","u64, exact integers, nested collections, order-sensitive folds and transactions remain on CPU","GPU unavailable, device loss, limits or validation errors fall back to compiled CPU","no universal performance or all-device GPU guarantee"]});
     Ok(Emission {
         manifest,
         shaders: files.into_iter().collect(),

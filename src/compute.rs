@@ -1280,7 +1280,8 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
     let mut files = BTreeMap::new();
     let mut functions = Vec::new();
     for (i, f) in p.functions.iter().enumerate() {
-        let compiled = shader(f, p);
+        let guard=p.contracts.precondition_checks.get(&f.name);
+        let compiled = if guard.is_some(){Err("contract precondition ingress uses the CPU host".into())}else{shader(f, p)};
         let (shader, lengths, direct_reason) = match compiled {
             Ok((s, l)) => {
                 let path = format!("compute-{i}.wgsl");
@@ -1289,7 +1290,7 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
             }
             Err(e) => (None, vec![], Some(e)),
         };
-        let (graph, graph_reason) = match graph::lower(f, p, i) {
+        let (graph, graph_reason) = match if guard.is_some(){Err("contract precondition ingress uses the CPU host".into())}else{graph::lower(f, p, i)} {
             Ok((descriptor, shaders)) => {
                 files.extend(shaders);
                 (Some(descriptor), None)
@@ -1307,7 +1308,7 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
                 graph_reason.unwrap_or_default()
             ))
         };
-        functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"graph":graph,"graph_required":required,"capacity_mode":"max","gpu_max_elements":if !required && heavy(&f.body,p,&mut std::collections::BTreeSet::new()){Some(128)}else{None},"fallback_reason":reason}));
+        functions.push(json!({"name":f.name,"index":i,"precondition":guard.map(|name|json!({"index":p.functions.iter().position(|g|&g.name==name).unwrap(),"result":{"kind":"bool"}})),"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"graph":graph,"graph_required":required,"capacity_mode":"max","gpu_max_elements":if !required && heavy(&f.body,p,&mut std::collections::BTreeSet::new()){Some(128)}else{None},"fallback_reason":reason}));
     }
     use sha2::{Digest, Sha256};
     let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; GPU lists carry a length header; records in declaration order; vectors unpadded","gpu_list_abi":"ink-gpu-list-v3","collection_strategy":"literal per-output evaluation; filters, ordered scans and stable rank sorts may do quadratic or greater work; profitability must be measured","float_contract":"integer-lane binary32; round-to-nearest ties-to-even, gradual underflow, signed zero, source operation order and canonical arithmetic NaN; pass-through/negation retain payload bits","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; saved profiles estimate profitability only"});
