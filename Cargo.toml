@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 [dependencies]
-ink-lowering-c = { git = "https://github.com/siliconjungle/ink-lowering-c", rev = "cefc24314affe142d6cda10aafe4b732c5bcc926" }
-ink-lowering-js = { git = "https://github.com/siliconjungle/ink-lowering-js", rev = "6f60891e89db087a8e0eb0be0bc582e644e44cf4" }
+ink-lowering-c = { git = "https://github.com/siliconjungle/ink-lowering-c", rev = "baf4feea3214748b0c256544d9300c32d8417242" }
+ink-lowering-js = { git = "https://github.com/siliconjungle/ink-lowering-js", rev = "0c10a999c2ebd5df0953352e8a08589f0e9e3f37" }
 ink-abi = { git = "https://github.com/siliconjungle/ink-abi", rev = "c800d60a4f49790dced13fc930b84ba7815d60a0" }
-ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "54db6b2ff194dd452d8cc224e13089a31da712c6" }
+ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "7e15268be35430f5bf310cf191dc4645f54e16ad" }
 serde_json = "1"
 sha2 = "0.10"
 
