@@ -40,3 +40,8 @@ readback copy and the public owned result remain required. Complete and prepared
 results survive readback unmap, caller mutation, subsequent runs and close; this
 does not expose a borrowed device view or claim zero-copy public outputs. Run
 `node tests/device_graph.mjs` for poison-on-unmap and retained-output coverage.
+
+## License
+
+Project code and documentation are [MIT licensed](LICENSE). Third-party dependencies,
+vendored projects and research data retain their own licenses and notices.
