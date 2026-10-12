@@ -7,7 +7,7 @@ publish = false
 ink-lowering-c = { git = "https://github.com/siliconjungle/ink-lowering-c", rev = "5f131aa8261ddf6ad9b8d8bdeee8251015de5bab" }
 ink-lowering-js = { git = "https://github.com/siliconjungle/ink-lowering-js", rev = "8b18ebf32db343872790b94b6da85c0b9c30bfcf" }
 ink-abi = { git = "https://github.com/siliconjungle/ink-abi", rev = "c800d60a4f49790dced13fc930b84ba7815d60a0" }
-ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "fdd78297cbe90a45e2d32fc745e9b42297fd83e7" }
+ink-core = { git = "https://github.com/siliconjungle/ink-lang", rev = "c0db2b5eca4adc3d82192399d2ee31c41e55d656" }
 serde_json = "1"
 sha2 = "0.10"
 
