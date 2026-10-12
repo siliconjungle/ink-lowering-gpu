@@ -51,6 +51,8 @@ use std::collections::BTreeMap;
 type Env = BTreeMap<String, (String, Type)>;
 #[path = "compute_graph.rs"]
 mod graph;
+#[path = "parallel.rs"]
+mod parallel;
 
 fn wg(t: &Type) -> LangResult<String> {
     Ok(match t {
@@ -1255,24 +1257,44 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
     decl.push_str(&format!("@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid:vec3<u32>){{let i=gid.x;if(i>=ink_meta[{nb}]){{return;}}\n{}\n}}",em.lines));
     Ok((decl, lengths))
 }
-fn heavy(e: &Expr, p: &Program, seen: &mut std::collections::BTreeSet<String>) -> bool {
+/// Per-element collection work in a direct shader: 0 none, 1 filter/scan
+/// (linear per invocation), 2 sort (quadratic stable rank per invocation).
+fn heavy(e: &Expr, p: &Program, seen: &mut std::collections::BTreeSet<String>) -> u8 {
+    let all = |es: &mut dyn Iterator<Item = &Expr>, seen: &mut std::collections::BTreeSet<String>| {
+        es.map(|e| heavy(e, p, seen)).max().unwrap_or(0)
+    };
     match e {
         Expr::Method(x, n, a) => {
-            ["filter", "scan", "sort"].contains(&n.as_str())
-                || heavy(x, p, seen)
-                || a.iter().any(|e| heavy(e, p, seen))
+            let own = match n.as_str() {
+                "sort" => 2,
+                "filter" | "scan" => 1,
+                _ => 0,
+            };
+            own.max(heavy(x, p, seen)).max(all(&mut a.iter(), seen))
         }
         Expr::Call(n, a) => {
-            a.iter().any(|e| heavy(e, p, seen))
-                || p.functions
-                    .iter()
-                    .find(|f| &f.name == n)
-                    .is_some_and(|f| seen.insert(n.clone()) && heavy(&f.body, p, seen))
+            let callee = p
+                .functions
+                .iter()
+                .find(|f| &f.name == n)
+                .filter(|_| seen.insert(n.clone()))
+                .map_or(0, |f| heavy(&f.body, p, seen));
+            callee.max(all(&mut a.iter(), seen))
         }
-        Expr::Let(_, _, a, b) | Expr::Binary(_, a, b) => heavy(a, p, seen) || heavy(b, p, seen),
+        Expr::Let(_, _, a, b) | Expr::Binary(_, a, b) => heavy(a, p, seen).max(heavy(b, p, seen)),
         Expr::Lambda(_, b) | Expr::Neg(b) | Expr::Field(b, _) => heavy(b, p, seen),
-        Expr::Record(_, fs) => fs.iter().any(|(_, e)| heavy(e, p, seen)),
-        _ => false,
+        Expr::Record(_, fs) => all(&mut fs.iter().map(|(_, e)| e), seen),
+        _ => 0,
+    }
+}
+/// Element bound for a direct shader whose invocations each repeat
+/// collection work: linear work per element up to 1,024 elements, quadratic
+/// sort per element up to 128. Graph stages have no such bound.
+fn heavy_limit(level: u8) -> Option<u32> {
+    match level {
+        0 => None,
+        1 => Some(1024),
+        _ => Some(128),
     }
 }
 pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> {
@@ -1296,8 +1318,8 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
             }
             Err(e) => (None, Some(e)),
         };
-        let required = graph.is_some()
-            && (shader.is_none() || heavy(&f.body, p, &mut std::collections::BTreeSet::new()));
+        let level = heavy(&f.body, p, &mut std::collections::BTreeSet::new());
+        let required = graph.is_some() && (shader.is_none() || level > 0);
         let reason = if shader.is_some() || graph.is_some() {
             None
         } else {
@@ -1307,7 +1329,7 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
                 graph_reason.unwrap_or_default()
             ))
         };
-        functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"graph":graph,"graph_required":required,"capacity_mode":"max","gpu_max_elements":if !required && heavy(&f.body,p,&mut std::collections::BTreeSet::new()){Some(128)}else{None},"fallback_reason":reason}));
+        functions.push(json!({"name":f.name,"index":i,"params":f.params.iter().map(|(n,t)|Ok(json!({"name":n,"type":desc(t,p)?}))).collect::<LangResult<Vec<_>>>()?,"result":desc(&f.result,p)?,"shader":shader,"lengths":lengths,"graph":graph,"graph_required":required,"capacity_mode":"max","gpu_max_elements":if required{None}else{heavy_limit(level)},"fallback_reason":reason}));
     }
     use sha2::{Digest, Sha256};
     let manifest = json!({"schema":2,"backend":"webgpu-wgpu-v2","core_semantics":checked.semantics(),"core_sha256":checked.identity()?,"shaders":files.iter().map(|(n,s)|(n.clone(),format!("{:x}",Sha256::digest(s.as_bytes())))).collect::<BTreeMap<_,_>>(),"functions":functions,"abi":"packed little-endian 32-bit lanes; GPU lists carry a length header; records in declaration order; vectors unpadded","gpu_list_abi":"ink-gpu-list-v3","collection_strategy":"literal per-output evaluation; filters, ordered scans and stable rank sorts may do quadratic or greater work; profitability must be measured","float_contract":"integer-lane binary32; round-to-nearest ties-to-even, gradual underflow, signed zero, source operation order and canonical arithmetic NaN; pass-through/negation retain payload bits","trust":["type checker","literal C and WGSL lowering","packed ABI and host pipeline execution","C/LLVM, WebGPU/wgpu and drivers"],"proof_claim":"no backend correctness proof or optimisation theorem; saved profiles estimate profitability only"});

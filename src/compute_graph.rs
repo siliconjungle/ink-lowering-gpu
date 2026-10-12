@@ -21,6 +21,9 @@ pub(super) fn load_list(t: &Type, buf: &str, index: &str, p: &Program) -> LangRe
     // storage access, rather than offsetting the index (which fails for records).
     Ok(load(t, buf, index, p)?.replace(&format!("{buf}["), &format!("{buf}[1u+")))
 }
+fn scalar_result(t: &Type) -> bool {
+    !matches!(t, Type::List(_))
+}
 fn leaf(t: &Type) -> &Type {
     if let Type::List(t) = t {
         t
@@ -261,6 +264,81 @@ impl Graph<'_> {
             _ => Ok(e.clone()),
         }
     }
+    /// Multi-pass parallel schedules for stages that a single GPU thread
+    /// used to run: integer scans and sums, stable filters, integer sorts
+    /// and concatenation. Float scans and sums keep their ordered serial
+    /// stage (source evaluation order is part of their meaning).
+    #[allow(clippy::too_many_arguments)]
+    fn parallel(
+        &mut self,
+        op: &str,
+        ty: &Type,
+        et: &Type,
+        refs: &[Ref],
+        slots: &[usize],
+        em: &mut Emitter,
+        decl: &mut String,
+        bindings: &Env,
+        callback: Option<&Expr>,
+    ) -> LangResult<Option<Ref>> {
+        use parallel::Kind;
+        let kind = match et {
+            Type::U32 => Some(Kind::U32),
+            Type::I32 => Some(Kind::I32),
+            Type::U64 => Some(Kind::U64),
+            _ => None,
+        };
+        let id = self.nodes.len();
+        let tag = format!("graph-{}-{id}", self.index);
+        let schedule = match (op, kind) {
+            ("scan", Some(k)) => parallel::scan_list(&tag, k, slots[0]),
+            ("sort", Some(k)) => parallel::sort_list(&tag, k, slots[0]),
+            ("sum", Some(k)) => parallel::sum_list(&tag, k, slots[0]),
+            ("concat", _) => parallel::concat_lists(&tag, slots[0], slots[1], lanes(et, self.p, true)?),
+            ("filter", _) => {
+                let Expr::Lambda(a, b) = callback.ok_or("stage callback missing")? else {
+                    return Err("stage needs lambda".into());
+                };
+                let src = format!("a{}", slots[0]);
+                let source = &refs[slots[0]];
+                let mut local = bindings.clone();
+                local.insert(
+                    a.clone(),
+                    (load_list(leaf(&source.ty), &src, "i", self.p)?, leaf(&source.ty).clone()),
+                );
+                let v = em.scalar(b, &local, &Type::Bool)?;
+                let mut code = decl.clone();
+                code.push_str(&format!(
+                    "@group(0) @binding({}) var<storage,read_write> flags:array<u32>;\n@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid:vec3<u32>){{\nlet size={src}[0];let i=gid.x;if(i<size){{\n{}\nflags[i]=select(0u,1u,{v});\n}}\n}}",
+                    refs.len(),
+                    em.lines
+                ));
+                let predicate = parallel::Pass {
+                    name: format!("{tag}-flags.wgsl"),
+                    code,
+                    bind: (0..refs.len()).map(|k| json!({"arg": k})).collect(),
+                    groups: "b1",
+                };
+                parallel::filter_list(&tag, predicate, slots[0], lanes(et, self.p, true)?)
+            }
+            _ => return Ok(None),
+        };
+        for pass in &schedule.passes {
+            self.shaders.insert(pass.name.clone(), pass.code.clone());
+        }
+        let capacity = if scalar_result(ty) {
+            json!({"kind":"one","args":[]})
+        } else {
+            json!({"kind":if op=="concat"{"sum"}else{"same"},"args":slots})
+        };
+        let mut node = json!({"id":id,"op":op,"args":refs.iter().map(|r|r.id.clone()).collect::<Vec<_>>(),"arg_types":refs.iter().map(|r|desc(&r.ty,self.p)).collect::<LangResult<Vec<_>>>()?,"result":desc(ty,self.p)?,"capacity":capacity,"shader":Value::Null,"workgroup_size":256,"ordered":false,"parallel":true});
+        node["schedule"] = schedule.descriptor();
+        self.nodes.push(node);
+        Ok(Some(Ref {
+            id: json!({"node":id}),
+            ty: ty.clone(),
+        }))
+    }
     fn node(
         &mut self,
         op: &str,
@@ -330,6 +408,9 @@ impl Graph<'_> {
         };
         let et = leaf(ty);
         let scalar = !matches!(ty, Type::List(_));
+        if let Some(r) = self.parallel(op, ty, et, &refs, &slots, &mut em, &mut decl, &bindings, callback)? {
+            return Ok(r);
+        }
         let serial = [
             "filter", "scan", "concat", "sum", "count", "foldr", "scalar",
         ]
@@ -525,7 +606,7 @@ pub(super) fn lower(
     let out = g.walk(&f.body, &env, Some(&f.result))?;
     // Full u64 arithmetic uses exact two-lane helpers in literal stages.
     Ok((
-        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"literal eager array stages; ordered sums forward, foldr last-to-first and explicit fold_until forward with termination; no reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","serial stable filter/scan/concat/ordered reductions","exact integer-lane binary32; canonical arithmetic NaN","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
+        json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"eager array stages; integer scans/sums (exactly wrapping), stable filters, integer radix sorts and concatenation run as parallel multi-pass schedules; float scans/sums, foldr and fold_until keep their ordered serial stage; no float reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","parallel schedules support capacities up to 256^3 elements","ordered float reductions and folds run serially","exact integer-lane binary32; canonical arithmetic NaN","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),
         g.shaders,
     ))
 }
