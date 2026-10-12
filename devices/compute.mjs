@@ -45,6 +45,12 @@ function scratchWords(spec, extent) {
   return Math.max(1,n);
 }
 const isGraph=p=>p.steps.some(s=>s.f.graph_required);
+export function dispatchCount(p) {
+  if(!isGraph(p))return p.steps.filter(s=>s.count!==0).length;
+  return p.steps.reduce((total,s)=>total+(s.f.graph?.nodes??[]).reduce(
+    (count,node)=>count+(node.schedule?node.schedule.passes.length:1),0),0);
+}
+const MAX_DISPATCHES=64*1024*1024;
 
 // Reads that return a few words instead of whole values.
 export const lanes=kind=>kind==='u64'?2:1;
@@ -205,6 +211,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
   }
   async function prepare(p) {
     if(p.reason)fail(p.reason);
+    if(p.iterations*dispatchCount(p)>MAX_DISPATCHES)fail('GPU dispatch budget exceeded');
     await ensureDevice();
     const limits=device.limits;
     if(isGraph(p)) {
@@ -338,6 +345,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
   // many dispatches; feedback copies end the pass.
   async function advance(r, p, iterations) {
     live(r);
+    if(iterations*dispatchCount(p)>MAX_DISPATCHES)fail('GPU dispatch budget exceeded');
     return scoped(()=>{
       let encoder=null,pass=null,passes=0,dispatches=0,copies=0;
       const end=()=>{if(pass){pass.end();pass=null;}};
@@ -442,7 +450,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
         const start=Math.min(q.slice[0],l.capacity),take=Math.min(q.slice[1],l.capacity-start);
         const [head,part]=await staging(r,[[l.buffer,0,4],[l.buffer,4+start*w*4,take*w*4]]);
         const n=header(head),available=Math.min(Math.max(0,n-start),take);
-        return {value:unpack(part.subarray(0,available*w),l.type),length:n,start,counters:{readback_bytes:4+take*w*4}};
+        return {value:unpack(part.subarray(0,available*w),l.type),length:n,start:Math.min(start,n),counters:{readback_bytes:4+take*w*4}};
       }
       if(typeof q.reduce==='string') {
         const {offset,type:field}=fieldPath(element,q.field,width),{kind,components}=reducible(field);

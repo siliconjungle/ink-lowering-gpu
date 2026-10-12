@@ -355,6 +355,9 @@ impl Gpu {
         }))
     }
     fn advance_inner(&self, r: &mut Resident, p: &Plan, iterations: u64) -> Result<Value> {
+        if iterations.saturating_mul(dispatch_count(p) as u64) > 64 * 1024 * 1024 {
+            return Err("GPU dispatch budget exceeded".into());
+        }
         let mut chunk = Chunk::new(self);
         let mut copies = 0usize;
         match r {
@@ -570,7 +573,7 @@ impl Gpu {
             return Ok(json!({
                 "value": unpack(&d, &l.ty),
                 "length": n,
-                "start": start,
+                "start": start.min(n),
                 "counters": {"readback_bytes": 4 + take * w * 4}
             }));
         }
@@ -1240,6 +1243,16 @@ if(wid.x==0u){{if(mode==1u){{out[0]=n;}}else{{out[0]=data[0];}}}}
 }
 
 /// Upper bounds only: logical list lengths remain in resident GPU headers.
+pub(super) fn dispatch_count(p: &Plan) -> usize {
+    if !p.steps.iter().any(|s| s.f["graph_required"] == true) {
+        return p.steps.iter().filter(|s| s.count != Some(0)).count();
+    }
+    p.steps.iter().map(|s| {
+        s.f["graph"]["nodes"].as_array().map_or(0, |nodes| {
+            nodes.iter().map(|n| n["schedule"]["passes"].as_array().map_or(1, Vec::len)).sum::<usize>()
+        })
+    }).sum()
+}
 pub(super) fn graph_capacity(graph: &Value, arguments: &[usize]) -> Result<(Vec<usize>, usize)> {
     let mut capacities = Vec::new();
     fn resolve(r: &Value, args: &[usize], nodes: &[usize]) -> Result<usize> {

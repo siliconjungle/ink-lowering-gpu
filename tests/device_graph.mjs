@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {createDevice,graphCapacity} from '../devices/compute.mjs';
+import {createDevice,graphCapacity,dispatchCount} from '../devices/compute.mjs';
 globalThis.GPUBufferUsage={MAP_READ:1,COPY_SRC:4,COPY_DST:8,STORAGE:128};globalThis.GPUShaderStage={COMPUTE:4};globalThis.GPUMapMode={READ:1};
 let live=0,peak=0,allocations=0,dispatches=0;
 // Each dispatch records the pipeline and bindings current at that point, as
@@ -66,4 +66,14 @@ assert.equal((await resident.run()).values.result,9);assert.equal(allocations,al
 const legacy={feedback:new Map(),constants:[{words:Uint32Array.from([0,4294967295]),type:list,count:2}],steps:[{f:functions[1],args:[{kind:'constant',index:0,count:2}],count:2}],outputs:['result'],ids:new Map([['result',0]]),iterations:1,reason:null};
 await engine.prepare(legacy);const complete=await engine.run(legacy);assert.deepEqual(complete.values.result,[1,0]);legacy.constants[0].words.fill(42);await engine.run(legacy);assert.deepEqual(complete.values.result,[1,0],'complete outputs survive subsequent call and caller mutation');legacy.constants[0].words.set([0,4294967295]);
 const legacyCall=await engine.capture(legacy);legacy.constants[0].words.fill(99);const a=await legacyCall.run();assert.deepEqual(a.values.result,[1,0]);assert.equal(a.counters.upload_bytes,0);assert.equal(a.counters.readback_bytes,12);assert.equal(a.counters.dispatches,1);const aCopy=[...a.values.result];await legacyCall.run();assert.deepEqual(a.values.result,aCopy);legacyCall.close();assert.equal(live,0);assert.deepEqual(a.values.result,[1,0],'retained output survives close');assert.deepEqual(complete.values.result,[1,0]);assert.equal(headerCopies,0,'owned readback header stripping uses a borrowed subview consumed before return');Uint32Array.prototype.slice=originalSlice;
+assert.equal(dispatchCount(p),3);
+const overDispatch={...p,iterations:1_000_000,steps:[{f:{graph_required:true,graph:{nodes:[{schedule:{passes:Array(100).fill({})}}]}}}]};
+assert.equal(dispatchCount(overDispatch),100);
+await assert.rejects(engine.prepare(overDispatch),/dispatch budget/);
+const slicePlan=plan([1,3,2,4]);slicePlan.ids.set('filtered',0);
+await engine.prepare(slicePlan);const sliceState=await engine.open(slicePlan);await engine.advance(sliceState,slicePlan,1);
+const shortSlice=await engine.read(sliceState,slicePlan,{step:'filtered',slice:[99,3]});
+assert.deepEqual({value:shortSlice.value,length:shortSlice.length,start:shortSlice.start},{value:[],length:2,start:2});
+await assert.rejects(engine.advance(sliceState,overDispatch,1_000_000),/dispatch budget/);
+engine.closeSession(sliceState);
 engine.close();console.log('PASS prepared graph/legacy residency, input capture, no repeated allocations, logical extents, owned output, cleanup');console.log('PASS graph capacity, mixed dynamic lengths, iteration buffer reuse, exact counters, empty stages, input nonmutation, resident feedback, alias swaps, capacity and allocation guards');
