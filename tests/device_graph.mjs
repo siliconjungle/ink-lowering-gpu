@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
-import {createDevice,graphCapacity} from '../devices/compute.mjs';
+import {createDevice,graphCapacity,dispatchCount} from '../devices/compute.mjs';
 globalThis.GPUBufferUsage={MAP_READ:1,COPY_SRC:4,COPY_DST:8,STORAGE:128};globalThis.GPUShaderStage={COMPUTE:4};globalThis.GPUMapMode={READ:1};
 let live=0,peak=0,allocations=0,dispatches=0;
+// Each dispatch records the pipeline and bindings current at that point, as
+// WebGPU does; one pass may carry many dispatches.
 // Mapped bytes are poisoned on readback unmap. Only the first owning copy may
 // escape; stripping a header must not copy the already-owned readback again.
 const mappedReadback=new WeakSet(),ownedReadback=new WeakSet();let headerCopies=0;
@@ -10,7 +12,7 @@ Uint32Array.prototype.slice=function(...args){if(ownedReadback.has(this.buffer))
 const device={limits:{maxStorageBuffersPerShaderStage:8,maxComputeWorkgroupsPerDimension:65535,maxBufferSize:1<<25,maxStorageBufferBindingSize:1<<25},lost:new Promise(()=>{}),pushErrorScope(){},async popErrorScope(){return null},
  createBuffer({size,usage}){live+=size;peak=Math.max(peak,live);allocations++;const data=new ArrayBuffer(size);if(usage&GPUBufferUsage.MAP_READ)mappedReadback.add(data);let dead=false;return {size,data,getMappedRange(){return data},unmap(){if(usage&GPUBufferUsage.MAP_READ)new Uint32Array(data).fill(0xdeadbeef)},async mapAsync(){},destroy(){if(!dead){live-=size;dead=true}}};},
  createBindGroupLayout(x){return x},createPipelineLayout(x){return x},createShaderModule(x){return x},async createComputePipelineAsync({compute}){return {kind:compute.module.code,getBindGroupLayout(){return {}}}},createBindGroup(x){return x},
- createCommandEncoder(){const commands=[];return {beginComputePass(){let pipe,group;return {setPipeline(p){pipe=p},setBindGroup(_,g){group=g},dispatchWorkgroups(){commands.push(()=>{dispatches++;const b=group.entries.map(e=>new Uint32Array(e.resource.buffer.data));const out=b.at(-1);if(pipe.kind==='filter'){let n=0;for(let i=0;i<b[0][0];i++)if(b[0][i+1]>b[1][0])out[++n]=b[0][i+1];out[0]=n;}else if(pipe.kind==='direct-map'){const dst=b[1];dst[0]=b[0][0];for(let i=0;i<b[0][0];i++)dst[i+1]=(b[0][i+1]+1)>>>0;}else if(pipe.kind==='map'){out[0]=b[0][0];for(let i=0;i<b[0][0];i++)out[i+1]=(b[0][i+1]+1)>>>0;}else if(pipe.kind==='sum'){let n=0;for(let i=0;i<b[0][0];i++)n=(n+b[0][i+1])>>>0;out[0]=n;}else throw Error('mock shader');})},end(){}}},copyBufferToBuffer(a,offset,b,target,bytes){commands.push(()=>new Uint8Array(b.data,target,bytes).set(new Uint8Array(a.data,offset,bytes)))},finish(){return commands}}},queue:{submit(lists){for(const list of lists)for(const f of list)f()}},destroy(){}};
+ createCommandEncoder(){const commands=[];return {beginComputePass(){let pipe,group;return {setPipeline(p){pipe=p},setBindGroup(_,g){group=g},dispatchWorkgroups(){const pipe0=pipe,group0=group;commands.push(()=>{const pipe=pipe0,group=group0;dispatches++;const b=group.entries.map(e=>new Uint32Array(e.resource.buffer.data));const out=b.at(-1);if(pipe.kind==='filter'){let n=0;for(let i=0;i<b[0][0];i++)if(b[0][i+1]>b[1][0])out[++n]=b[0][i+1];out[0]=n;}else if(pipe.kind==='direct-map'){const dst=b[1];dst[0]=b[0][0];for(let i=0;i<b[0][0];i++)dst[i+1]=(b[0][i+1]+1)>>>0;}else if(pipe.kind==='map'){out[0]=b[0][0];for(let i=0;i<b[0][0];i++)out[i+1]=(b[0][i+1]+1)>>>0;}else if(pipe.kind==='sum'){let n=0;for(let i=0;i<b[0][0];i++)n=(n+b[0][i+1])>>>0;out[0]=n;}else throw Error('mock shader');})},end(){}}},copyBufferToBuffer(a,offset,b,target,bytes){commands.push(()=>new Uint8Array(b.data,target,bytes).set(new Uint8Array(a.data,offset,bytes)))},finish(){return commands}}},queue:{submit(lists){for(const list of lists)for(const f of list)f()}},destroy(){}};
 Object.defineProperty(globalThis,'navigator',{value:{gpu:{async requestAdapter(){return {async requestDevice(){return device}}}}}});
 globalThis.fetch=async url=>({async text(){return String(url).split('/').at(-1)}});
 const list={kind:'list',element:{kind:'u32'}},word={kind:'u32'};
@@ -64,4 +66,14 @@ assert.equal((await resident.run()).values.result,9);assert.equal(allocations,al
 const legacy={feedback:new Map(),constants:[{words:Uint32Array.from([0,4294967295]),type:list,count:2}],steps:[{f:functions[1],args:[{kind:'constant',index:0,count:2}],count:2}],outputs:['result'],ids:new Map([['result',0]]),iterations:1,reason:null};
 await engine.prepare(legacy);const complete=await engine.run(legacy);assert.deepEqual(complete.values.result,[1,0]);legacy.constants[0].words.fill(42);await engine.run(legacy);assert.deepEqual(complete.values.result,[1,0],'complete outputs survive subsequent call and caller mutation');legacy.constants[0].words.set([0,4294967295]);
 const legacyCall=await engine.capture(legacy);legacy.constants[0].words.fill(99);const a=await legacyCall.run();assert.deepEqual(a.values.result,[1,0]);assert.equal(a.counters.upload_bytes,0);assert.equal(a.counters.readback_bytes,12);assert.equal(a.counters.dispatches,1);const aCopy=[...a.values.result];await legacyCall.run();assert.deepEqual(a.values.result,aCopy);legacyCall.close();assert.equal(live,0);assert.deepEqual(a.values.result,[1,0],'retained output survives close');assert.deepEqual(complete.values.result,[1,0]);assert.equal(headerCopies,0,'owned readback header stripping uses a borrowed subview consumed before return');Uint32Array.prototype.slice=originalSlice;
+assert.equal(dispatchCount(p),3);
+const overDispatch={...p,iterations:1_000_000,steps:[{f:{graph_required:true,graph:{nodes:[{schedule:{passes:Array(100).fill({})}}]}}}]};
+assert.equal(dispatchCount(overDispatch),100);
+await assert.rejects(engine.prepare(overDispatch),/dispatch budget/);
+const slicePlan=plan([1,3,2,4]);slicePlan.ids.set('filtered',0);
+await engine.prepare(slicePlan);const sliceState=await engine.open(slicePlan);await engine.advance(sliceState,slicePlan,1);
+const shortSlice=await engine.read(sliceState,slicePlan,{step:'filtered',slice:[99,3]});
+assert.deepEqual({value:shortSlice.value,length:shortSlice.length,start:shortSlice.start},{value:[],length:2,start:2});
+await assert.rejects(engine.advance(sliceState,overDispatch,1_000_000),/dispatch budget/);
+engine.closeSession(sliceState);
 engine.close();console.log('PASS prepared graph/legacy residency, input capture, no repeated allocations, logical extents, owned output, cleanup');console.log('PASS graph capacity, mixed dynamic lengths, iteration buffer reuse, exact counters, empty stages, input nonmutation, resident feedback, alias swaps, capacity and allocation guards');
