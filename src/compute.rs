@@ -361,6 +361,12 @@ impl Emitter<'_> {
                     Ok(self.add(op, &x, &y, &ot))
                 }
             }
+            Expr::Call(n,a) if ink_core::primitives::primitive(n) => {
+                let first=if ink_core::primitives::bit_count(n){a.first().map(|a|check::infer(a,&Self::types(env),self.p)).transpose()?}else{None};
+                let (params,_)=ink_core::primitives::signature(n,first.as_ref())?;
+                let values=a.iter().zip(params).map(|(a,t)|self.scalar(a,env,&t)).collect::<LangResult<Vec<_>>>()?;
+                crate::primitive_emit::expression(n,&values,first.as_ref())
+            }
             Expr::Call(n, a) if n == "choose" => {
                 let c = self.scalar(&a[0], env, &Type::Bool)?;
                 let out = self.fresh();

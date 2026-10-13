@@ -45,3 +45,56 @@ fn ink_f32_mul(a:u32,b:u32)->u32{
  let shift=select(20u,21u,high);let extended=(product.lo>>shift)|(product.hi<<(32u-shift))|select(0u,1u,(product.lo&((1u<<shift)-1u))!=0u);
  return ink_f32_round(sign,ea+eb-127i+select(0i,1i,high),extended);
 }
+// Exact sqrt and division use integer significands, independent of WGSL float
+// approximation allowances and device flush-to-zero behavior.
+fn ink_f32_sqrt(x:u32)->u32{
+ let a=x&0x7fffffffu;if(a==0u){return x;}
+ if(a>0x7f800000u||(x&0x80000000u)!=0u){return 0x7fc00000u;}
+ if(a==0x7f800000u){return x;}
+ let raw=(x>>23u)&255u;var m=(x&0x7fffffu)|select(0u,0x800000u,raw!=0u);var e=i32(max(raw,1u))-127i;
+ loop{if(m>=0x800000u){break;}m<<=1u;e--;}
+ let odd=e&1i;var half=(e-odd)/2i;let shift=23u+u32(odd);
+ let n=InkU64(m<<shift,m>>(32u-shift));var lo=0u;var hi=0x1000000u;
+ loop{if(lo+1u>=hi){break;}let mid=(lo+hi)>>1u;let sq=ink_u64_mul(InkU64(mid,0u),InkU64(mid,0u));if(!ink_u64_lt(n,sq)){lo=mid;}else{hi=mid;}}
+ let sq=ink_u64_mul(InkU64(lo,0u),InkU64(lo,0u));let rem=ink_u64_sub(n,sq);
+ if(ink_u64_lt(InkU64(lo,0u),rem)){lo++;}
+ if(lo==0x1000000u){lo>>=1u;half++;}
+ return (u32(half+127i)<<23u)|(lo&0x7fffffu);
+}
+fn ink_f32_div(a:u32,b:u32)->u32{
+ let aa=a&0x7fffffffu;let bb=b&0x7fffffffu;let sign=(a^b)&0x80000000u;
+ if(ink_f32_nan(a)||ink_f32_nan(b)||(aa==0u&&bb==0u)||(aa==0x7f800000u&&bb==aa)){return 0x7fc00000u;}
+ if(aa==0x7f800000u||bb==0u){return sign|0x7f800000u;}
+ if(aa==0u||bb==0x7f800000u){return sign;}
+ let ra=(a>>23u)&255u;let rb=(b>>23u)&255u;var ea=i32(max(ra,1u))-127i;var eb=i32(max(rb,1u))-127i;
+ var sa=(a&0x7fffffu)|select(0u,0x800000u,ra!=0u);var sb=(b&0x7fffffu)|select(0u,0x800000u,rb!=0u);
+ loop{if(sa>=0x800000u){break;}sa<<=1u;ea--;}
+ loop{if(sb>=0x800000u){break;}sb<<=1u;eb--;}
+ var e=ea-eb;if(sa<sb){sa<<=1u;e--;}
+ let division=ink_u64_div(InkU64(sa<<26u,sa>>6u),InkU64(sb,0u));
+ let extended=division.quotient.lo|select(0u,1u,!ink_u64_eq(division.remainder,InkU64(0u,0u)));
+ return ink_f32_round(sign,e+127i,extended);
+}
+// mode: 0 trunc, 1 floor, 2 ceil, 3 ties-to-even.
+fn ink_f32_integral(x:u32,mode:u32)->u32{
+ let a=x&0x7fffffffu;let sign=x&0x80000000u;
+ if(a>0x7f800000u){return 0x7fc00000u;}if(a>=0x4b000000u||a==0u){return x;}
+ let e=i32((x>>23u)&255u)-127i;
+ if(e<0i){var up=false;if(mode==1u){up=sign!=0u;}else if(mode==2u){up=sign==0u;}else if(mode==3u){up=a>0x3f000000u;}return sign|select(0u,0x3f800000u,up);}
+ let shift=u32(23i-e);let mask=(1u<<shift)-1u;let fraction=a&mask;var rounded=a&~mask;var up=false;
+ if(fraction!=0u){if(mode==1u){up=sign!=0u;}else if(mode==2u){up=sign==0u;}else if(mode==3u){let half=1u<<(shift-1u);up=fraction>half||(fraction==half&&((rounded>>shift)&1u)!=0u);}}
+ if(up){rounded+=1u<<shift;}return sign|rounded;
+}
+fn ink_f32_from_u64(x:InkU64)->u32{
+ if(ink_u64_eq(x,InkU64(0u,0u))){return 0u;}
+ let leading=select(countLeadingZeros(x.lo)+32u,countLeadingZeros(x.hi),x.hi!=0u);let e=63u-leading;
+ if(e<=23u){return ((e+127u)<<23u)|((x.lo<<(23u-e))&0x7fffffu);}
+ let shift=e-23u;var sig=0u;var rem=InkU64(0u,0u);var half=InkU64(0u,0u);
+ if(shift<32u){sig=(x.lo>>shift)|(x.hi<<(32u-shift));rem=InkU64(x.lo&((1u<<shift)-1u),0u);half=InkU64(1u<<(shift-1u),0u);}
+ else if(shift==32u){sig=x.hi;rem=InkU64(x.lo,0u);half=InkU64(0x80000000u,0u);}
+ else{sig=x.hi>>(shift-32u);rem=InkU64(x.lo,x.hi&((1u<<(shift-32u))-1u));half=InkU64(0u,1u<<(shift-33u));}
+ if(ink_u64_lt(half,rem)||(ink_u64_eq(rem,half)&&(sig&1u)!=0u)){sig++;}
+ var exponent=e+127u;if(sig==0x1000000u){sig>>=1u;exponent++;}
+ return (exponent<<23u)|(sig&0x7fffffu);
+}
+fn ink_f32_from_i32(x:i32)->u32{let neg=x<0i;let magnitude=select(u32(x),0u-u32(x),neg);return ink_f32_from_u64(InkU64(magnitude,0u))|select(0u,0x80000000u,neg);}
