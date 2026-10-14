@@ -20,7 +20,14 @@ const graph=(op,result,args,kind,indices)=>({nodes:[{id:0,op,args:args.map(param
 const functions=[{graph_required:true,graph:graph('filter',list,[0,1],'same',[0]),result:list},{shader:'direct-map',graph_required:false,graph:graph('map',list,[0],'same',[0]),result:list},{graph_required:true,graph:graph('sum',word,[0],'one',[]),result:word}];
 const engine=createDevice({root:new URL('http://mock/'),enabled:true,onLost(){},fail(s){throw Error(s)},width(t){return t.kind==='list'?this?.width?.(t.element)??1:1},unpack(w,t){return t.kind==='list'?[...w]:w[0]},MAX_BYTES:1024*1024});
 function plan(input,iterations=1){return {inputs:new Map([['xs',{index:0}]]),feedback:new Map(),constants:[{words:Uint32Array.from(input),type:list,count:input.length},{words:Uint32Array.of(2),type:word,count:1}],steps:[{f:functions[0],args:[{kind:'constant',index:0,count:input.length},{kind:'constant',index:1,count:1}],count:input.length},{f:functions[1],args:[{kind:'step',index:0,count:input.length}],count:input.length},{f:functions[2],args:[{kind:'step',index:1,count:input.length}],count:1}],outputs:['result'],ids:new Map([['result',2]]),iterations,reason:null};}
-const p=plan([1,3,2,4],3);await engine.prepare(p);const result=await engine.run(p);
+const p=plan([1,3,2,4],3);
+assert.deepEqual(engine.preparation(p),{device:false,shaders:[['filter',false],['map',false],['sum',false]]});
+await engine.prepare(p);
+assert.deepEqual(engine.preparation(p),{device:true,shaders:[['filter',true],['map',true],['sum',true]]});
+assert.deepEqual(engine.preparation({steps:[{f:{shader:'unprepared'}}]}),{device:true,shaders:[['unprepared',false]]});
+const preparation=engine.preparation(p);preparation.shaders[0][1]=false;
+assert.equal(engine.preparation(p).shaders[0][1],true);
+const result=await engine.run(p);
 assert.equal(result.values.result,9);assert.equal(result.counters.dispatches,9);assert.equal(dispatches,9);assert.equal(result.counters.upload_bytes,24);assert.equal(result.counters.readback_bytes,4);assert.equal(result.counters.live_buffer_bytes,peak);assert.equal(allocations,6);assert.equal(live,0);assert.deepEqual([...p.constants[0].words],[1,3,2,4]);
 const empty=plan([]);await engine.prepare(empty);assert.equal((await engine.run(empty)).values.result,0);assert.equal(live,0);
 for(const input of [[1,3,2,4],[0,1],[]]) {

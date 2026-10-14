@@ -555,7 +555,14 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
       } catch(e){close(r);throw e;}
     },close:()=>close(r)};
   }
-  return {prepare,run,capture,open,advance,read,write,view,finish,close:closeAll,
+  // Read-only cost context. A prepared device does not imply that this plan's
+  // shaders have been compiled, and partial preparation can survive a failure.
+  function preparation(p){
+    const names=isGraph(p)?p.steps.flatMap(s=>(s.f.graph?.nodes??[]).flatMap(n=>n.schedule?n.schedule.passes.map(pass=>pass.shader):[n.shader])):p.steps.map(s=>s.f.shader);
+    const ready=!!device&&!lost&&!gpuError;
+    return {device:ready,shaders:[...new Set(names)].sort().map(name=>[name,ready&&pipelines.has(name)])};
+  }
+  return {prepare,preparation,run,capture,open,advance,read,write,view,finish,close:closeAll,
     closeSession:close,handle:()=>device,
   };
   function closeAll(){for(const r of [...residents])close(r);if(!supplied)device?.destroy();lost=true;gpuError="engine disposed";pipelines.clear();}
