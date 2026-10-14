@@ -2,7 +2,7 @@
 
 Literal WGSL emission and WebGPU/wgpu device adapters for Ink's checked pure programs. `gpu::lower(&CheckedModule)` returns a manifest and shader artifacts. It performs capability checks, without selecting optimisation laws, assembling CPU fallback, invoking toolchains or scheduling mixed targets.
 
-`shaders/` owns stable filter/reduction primitives. `devices/` owns buffer allocation, uploads, dispatch, pipelines, validation, device loss and readback for the versioned scalar and packed compute runtime ABIs. Browser adapters expose `createDevice`; native adapters are included as a device module in generated projects. Host scheduling, saved-model selection, Wasm/native C fallback and bundle assembly live in [ink-runtime](https://github.com/siliconjungle/ink-runtime). This package pins the semantic core and ink-abi. Shader emission is independent; recursive host lanes reuse literal C and JavaScript representation emission. Runtime owns orchestration.
+`shaders/` owns stable filter/reduction primitives. `devices/` owns buffer allocation, uploads, dispatch, pipelines, validation, device loss and readback for the versioned scalar and packed compute runtime ABIs. Browser adapters expose `createDevice`; native adapters are included as a device module in generated projects. Host scheduling, saved-model selection, Wasm/native C fallback and bundle assembly live in [ink-runtime](https://github.com/siliconjungle/ink-runtime). This package pins the semantic core and ink-abi. Shader emission is independent; recursive host lanes reuse literal Rust and JavaScript representation emission. Runtime owns orchestration.
 
 Supported scalar kernels use u32 map/filter followed by sum/count; unsupported functions retain a CPU artifact through runtime orchestration. Packed compute supports multiple typed arrays, vector/record layouts, indexed reads and bounded loops. Literal packed stage graphs additionally support materialized map/indexed map/filter/zip/concat/scan stages and ordered scalar sum/count/fold/lookup consumers. Map/indexed/zip nodes run in parallel. Integer scan/sort/sum and any-type filter/concat nodes carry parallel multi-pass schedules (`src/parallel.rs`: three-level block scan, stable LSD radix sort, grid-stride sums, flag-scan-scatter filter, copy concat) as manifest data; f32 sums, folds and counts keep one ordered invocation. List length headers remain resident between stages, including across mixed function pipelines; buffers are reused across requested iterations. Fold execution visits elements last-to-first and sum visits first-to-last without tree reassociation. No source stages are fused by this backend.
 
@@ -45,3 +45,11 @@ does not expose a borrowed device view or claim zero-copy public outputs. Run
 
 Project code and documentation are [MIT licensed](LICENSE). Third-party dependencies,
 vendored projects and research data retain their own licenses and notices.
+
+Literal list constructors have a fixed compile-time capacity; `take` and `drop`
+retain input capacity bounds and write their clipped logical length. Collection
+views inside callbacks preserve indices and order. Packed payload offsets are
+constructed structurally so reads in an index expression retain their own offset.
+These are literal operations, not hash recognition, fusion or reassociation.
+The literal-graph fixture includes empty, oversized and nested slices; its oracle
+frames can be exported with `INK_GPU_GRAPH_EXPORT` for actual-device validation.

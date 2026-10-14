@@ -84,3 +84,6 @@ assert.deepEqual({value:shortSlice.value,length:shortSlice.length,start:shortSli
 await assert.rejects(engine.advance(sliceState,overDispatch,1_000_000),/dispatch budget/);
 engine.closeSession(sliceState);
 engine.close();console.log('PASS prepared graph/legacy residency, input capture, no repeated allocations, logical extents, owned output, cleanup');console.log('PASS graph capacity, mixed dynamic lengths, iteration buffer reuse, exact counters, empty stages, input nonmutation, resident feedback, alias swaps, capacity and allocation guards');
+
+for(const value of [0,1,16,0xffffffff]) assert.deepEqual(graphCapacity({nodes:[{args:[],capacity:{kind:'fixed',value,args:[]}}],output:{node:0}},[]),{capacities:[value],outputCount:value});
+for(const value of [-1,0x100000000,NaN,Infinity,0.5,undefined]) assert.throws(()=>graphCapacity({nodes:[{args:[],capacity:{kind:'fixed',value,args:[]}}],output:{node:0}},[]),/capacity/);

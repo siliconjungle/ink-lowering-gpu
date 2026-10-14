@@ -1283,6 +1283,8 @@ pub(super) fn graph_capacity(graph: &Value, arguments: &[usize]) -> Result<(Vec<
             })
             .collect::<Result<Vec<_>>>()?;
         let cap = match node["capacity"]["kind"].as_str() {
+            Some("fixed") => usize::try_from(node["capacity"]["value"].as_u64().ok_or("invalid fixed capacity")?)
+                .map_err(|_| "fixed capacity overflow")?,
             Some("one") => 1,
             Some("same") => *values.first().ok_or("missing same capacity")?,
             Some("min") => *values.iter().min().ok_or("missing min capacity")?,
