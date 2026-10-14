@@ -17,9 +17,8 @@ struct Graph<'a> {
 }
 
 pub(super) fn load_list(t: &Type, buf: &str, index: &str, p: &Program) -> LangResult<String> {
-    // load() multiplies the element index by its flat width. Offset each actual
-    // storage access, rather than offsetting the index (which fails for records).
-    Ok(load(t, buf, index, p)?.replace(&format!("{buf}["), &format!("{buf}[1u+")))
+    // Offset only the loaded payload, never reads inside the index expression.
+    super::load_list(t, buf, index, p)
 }
 fn scalar_result(t: &Type) -> bool {
     !matches!(t, Type::List(_))
@@ -111,6 +110,9 @@ impl Graph<'_> {
             return self.walk(b, &local, Some(&ty));
         }
         if let Expr::Call(n, args) = e {
+            if n == "list" {
+                return self.node("list", &ty, env, vec![], Some(e), None, None);
+            }
             if let Some(f) = self.p.functions.iter().find(|f| &f.name == n).cloned() {
                 let mut local = GraphEnv::new();
                 for ((name, t), arg) in f.params.iter().zip(args) {
@@ -151,14 +153,14 @@ impl Graph<'_> {
                 "zip",
                 "concat",
                 "scan",
-                "sort",
+                "sort", "take", "drop",
             ]
             .contains(&n.as_str())
             {
                 let src = self.walk(
                     xs,
                     env,
-                    if ["filter", "concat", "scan", "sort"].contains(&n.as_str()) {
+                    if ["filter", "concat", "scan", "sort", "take", "drop"].contains(&n.as_str()) {
                         Some(&ty)
                     } else {
                         None
@@ -172,6 +174,9 @@ impl Graph<'_> {
                         self.walk(&args[0], env, if n == "concat" { Some(&ty) } else { None })?;
                     self.alias(other.clone(), &mut local);
                     inputs.push(other);
+                }
+                if n == "take" || n == "drop" {
+                    return self.node(n, &ty, &local, inputs, None, args.first(), None);
                 }
                 let callback = if n == "zip" {
                     args.get(1)
@@ -418,7 +423,32 @@ impl Graph<'_> {
         let src = slots.first().map(|i| format!("a{i}"));
         let len = src.as_ref().map(|b| format!("{b}[0]"));
         let mut local = bindings.clone();
+        let mut prefix = String::new();
+        if op == "take" || op == "drop" {
+            let count = em.scalar(initial.ok_or("slice count missing")?, &local, &Type::U32)?;
+            em.line(format!("let clipped=min({}, {count});", len.as_ref().unwrap()));
+            prefix = std::mem::take(&mut em.lines);
+        }
         match op {
+            "list" => {
+                let Expr::Call(_, items) = expression.ok_or("list expression missing")? else {
+                    return Err("list constructor missing".into());
+                };
+                em.line("switch(i){");
+                for (index, item) in items.iter().enumerate() {
+                    em.line(format!("case {index}u:{{"));
+                    let value = em.scalar(item, &local, et)?;
+                    let value = em.bind(et, &value)?;
+                    em.line(store(et, &value, &format!("1u+i*{}u", lanes(et, self.p, true)?), &mut 0, self.p)?);
+                    em.line("}");
+                }
+                em.line("default:{} }");
+            }
+            "take" | "drop" => {
+                let index = if op == "take" { "i" } else { "(i+clipped)" };
+                let value = load_list(et, src.as_ref().unwrap(), index, self.p)?;
+                em.line(store(et, &value, &format!("1u+i*{}u", lanes(et,self.p,true)?), &mut 0, self.p)?);
+            }
             "map" | "filter" | "map_indexed" | "zip" => {
                 let Expr::Lambda(a, b) = callback.ok_or("stage callback missing")? else {
                     return Err("stage needs lambda".into());
@@ -541,13 +571,18 @@ impl Graph<'_> {
             _ => return Err("unknown literal graph stage".into()),
         }
         let body = if !serial {
-            let size = if op == "zip" {
+            let size = if op == "list" {
+                let Expr::Call(_, items) = expression.unwrap() else { unreachable!() };
+                format!("{}u", items.len())
+            } else if op == "take" || op == "drop" {
+                if op == "take" { "clipped".into() } else { format!("({}-clipped)",len.as_ref().unwrap()) }
+            } else if op == "zip" {
                 format!("min({},a{}[0])", len.as_ref().unwrap(), slots[1])
             } else {
                 len.clone().unwrap()
             };
             format!(
-                "let size={size};let i=gid.x;if(i==0u){{output[0]=size;}}if(i<size){{\n{}\n}}",
+                "{prefix}let size={size};let i=gid.x;if(i==0u){{output[0]=size;}}if(i<size){{\n{}\n}}",
                 em.lines
             )
         } else {
@@ -565,7 +600,10 @@ impl Graph<'_> {
         let id = self.nodes.len();
         let shader = format!("graph-{}-{id}.wgsl", self.index);
         self.shaders.insert(shader.clone(), decl);
-        let capacity = if scalar {
+        let capacity = if op == "list" {
+            let Expr::Call(_, items) = expression.unwrap() else { unreachable!() };
+            json!({"kind":"fixed","value":items.len(),"args":[]})
+        } else if scalar {
             json!({"kind":"one","args":[]})
         } else {
             json!({"kind":if op=="zip"{"min"}else if op=="concat"{"sum"}else{"same"},"args":slots})
