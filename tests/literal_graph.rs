@@ -28,6 +28,10 @@ fn materializes_each_literal_stage_and_ordered_reducer() {
         ("helper_pipeline", vec!["filter", "map"]),
         ("count_filtered", vec!["filter", "count"]),
         ("safe_read", vec!["map", "scalar"]),
+        ("sliced", vec!["drop", "take", "map"]),
+        ("literal", vec!["list", "drop", "take"]),
+        ("empty", vec!["list", "drop", "take"]),
+        ("nested_slice", vec!["list", "map"]),
     ] {
         assert_eq!(ops(&e, name), expected, "{name}");
     }
@@ -75,7 +79,7 @@ fn materializes_each_literal_stage_and_ordered_reducer() {
         }
         let mut frames = Vec::new();
         for f in &p.functions {
-            for profile in 0..7 {
+            for profile in 0..9 {
                 let mut args = Vec::new();
                 for (slot, (name, t)) in f.params.iter().enumerate() {
                     args.push(match t {
@@ -83,7 +87,7 @@ fn materializes_each_literal_stage_and_ordered_reducer() {
     ink_lowering_gpu::syntax::Type::U32=>match profile {0=>json!([]),1=>json!([3]),2=>json!([2,9,3,0,7]),3=>json!([4294967295u32,0,2147483648u32,7]),4=>if slot==0{json!([5,1,3,9])}else{json!([2,8])},5=>json!([0,1,2,3]),_=>json!([0,4294967295u32])},
     ink_lowering_gpu::syntax::Type::I32=>match profile {0=>json!([]),1=>json!([-3]),3=>json!([-2147483648i64,2147483647,0,-1]),4=>if slot==0{json!([4,-3,2])}else{json!([-7])},_=>json!([3,-5,8])},
     ink_lowering_gpu::syntax::Type::F32=>match profile {0=>json!([]),1=>json!([-0.0]),5=>json!([16777216.0,1.0,-16777216.0]),6=>json!([{"F32Bits":2143289345u32},{"F32Bits":2139095040u32},{"F32Bits":2147483648u32}]),_=>json!([3.5,-2.0,0.5])},_=>unreachable!()},
-   ink_lowering_gpu::syntax::Type::U32=>if profile==3{json!(0)}else if name=="k"{json!(3)}else{json!(8)},
+   ink_lowering_gpu::syntax::Type::U32=>if profile==3{json!(0)}else if profile==7{json!(4294967295u32)}else if profile==8{json!(1)}else if name=="k"{json!(3)}else{json!(8)},
    ink_lowering_gpu::syntax::Type::F32=>json!(1.0),_=>unreachable!()
   });
                 }

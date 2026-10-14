@@ -45,3 +45,11 @@ does not expose a borrowed device view or claim zero-copy public outputs. Run
 
 Project code and documentation are [MIT licensed](LICENSE). Third-party dependencies,
 vendored projects and research data retain their own licenses and notices.
+
+Literal list constructors have a fixed compile-time capacity; `take` and `drop`
+retain input capacity bounds and write their clipped logical length. Collection
+views inside callbacks preserve indices and order. Packed payload offsets are
+constructed structurally so reads in an index expression retain their own offset.
+These are literal operations, not hash recognition, fusion or reassociation.
+The literal-graph fixture includes empty, oversized and nested slices; its oracle
+frames can be exported with `INK_GPU_GRAPH_EXPORT` for actual-device validation.

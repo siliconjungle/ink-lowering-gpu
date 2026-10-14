@@ -922,7 +922,11 @@ impl Emitter<'_> {
             }
             Expr::Method(xs, n, a) => {
                 let len = self.length(xs, env)?;
-                if n == "zip" {
+                if n == "take" || n == "drop" {
+                    let count = self.scalar(&a[0], env, &Type::U32)?;
+                    let clipped = format!("min({len},{count})");
+                    Ok(if n == "take" { clipped } else { format!("({len}-{clipped})") })
+                } else if n == "zip" {
                     let other = self.length(&a[0], env)?;
                     Ok(format!("min({len},{other})"))
                 } else if n == "filter" {
@@ -999,6 +1003,12 @@ impl Emitter<'_> {
                 let Type::List(st) = check::infer(xs, &Self::types(env), self.p)? else {
                     return Err("list type".into());
                 };
+                if n == "take" { return self.element(xs, index, env); }
+                if n == "drop" {
+                    let len = self.length(xs, env)?;
+                    let count = self.scalar(&a[0], env, &Type::U32)?;
+                    return self.element(xs, &format!("({index}+min({len},{count}))"), env);
+                }
                 if n == "scan" {
                     let out = self.bind(
                         &et,
@@ -1115,6 +1125,9 @@ impl Emitter<'_> {
 // Packed storage avoids vec3 padding, Bool storage restrictions and host-specific
 // struct alignment. The descriptor defines word order independently of placement.
 fn load(t: &Type, buf: &str, index: &str, p: &Program) -> LangResult<String> {
+    load_with_header(t, buf, index, p, 0)
+}
+fn load_with_header(t: &Type, buf: &str, index: &str, p: &Program, header: usize) -> LangResult<String> {
     let width = lanes(t, p, true)?;
     fn go(t: &Type, buf: &str, base: &str, offset: &mut usize, p: &Program) -> LangResult<String> {
         let v = match t {
@@ -1150,10 +1163,10 @@ fn load(t: &Type, buf: &str, index: &str, p: &Program) -> LangResult<String> {
         };
         Ok(v)
     }
-    go(t, buf, &format!("({index})*{width}u"), &mut 0, p)
+    go(t, buf, &format!("{header}u+({index})*{width}u"), &mut 0, p)
 }
 fn load_list(t: &Type, buf: &str, index: &str, p: &Program) -> LangResult<String> {
-    Ok(load(t, buf, index, p)?.replace(&format!("{buf}["), &format!("{buf}[1u+")))
+    load_with_header(t, buf, index, p, 1)
 }
 fn store(t: &Type, value: &str, base: &str, off: &mut usize, p: &Program) -> LangResult<String> {
     Ok(match t {
