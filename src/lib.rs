@@ -1,4 +1,5 @@
 mod primitive_emit;
+mod word_emit;
 pub use ink_core::*;
 pub mod compute;
 pub mod gpu;

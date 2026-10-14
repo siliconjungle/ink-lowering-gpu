@@ -51,6 +51,16 @@ impl Scalar<'_> {
                 .get(n)
                 .map(|(x, _)| x.clone())
                 .ok_or_else(|| format!("GPU unknown binding {n}")),
+            Expr::Call(n,a) if ink_core::word::primitive(n) => {
+                let mut values=Vec::new();
+                for (arg,ty) in a.iter().zip(ink_core::word::arguments(n,&ty)) {
+                    let value=self.emit(arg,env,&ty)?;
+                    let name=format!("ink_word_{}",self.next);self.next+=1;
+                    self.lines.push_str(&format!("let {name}:u32={value};\n"));
+                    values.push(name);
+                }
+                crate::word_emit::expression(n,&values,&ty)
+            }
             Expr::Binary(op, a, b) => {
                 let operand = if check::is_word(&ty) {
                     ty

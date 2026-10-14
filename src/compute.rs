@@ -361,6 +361,15 @@ impl Emitter<'_> {
                     Ok(self.add(op, &x, &y, &ot))
                 }
             }
+            Expr::Call(n,a) if ink_core::word::primitive(n) => {
+                let params=ink_core::word::arguments(n,t);
+                let mut values=Vec::new();
+                for (arg,ty) in a.iter().zip(params) {
+                    let value=self.scalar(arg,env,&ty)?;
+                    values.push(self.bind(&ty,&value)?);
+                }
+                crate::word_emit::expression(n,&values,t)
+            }
             Expr::Call(n,a) if ink_core::primitives::primitive(n) => {
                 let first=if ink_core::primitives::bit_count(n){a.first().map(|a|check::infer(a,&Self::types(env),self.p)).transpose()?}else{None};
                 let (params,_)=ink_core::primitives::signature(n,first.as_ref())?;
