@@ -60,6 +60,7 @@ fn wg(t: &Type) -> LangResult<String> {
         Type::U64 => "InkU64".into(),
         Type::I32 => "i32".into(),
         Type::F32 => "u32".into(),
+        Type::F64 => return Err("binary64 device arithmetic is unsupported; retain the CPU implementation".into()),
         Type::Bool => "bool".into(),
         Type::Vector(t, n) => format!("vec{n}<{}>", wg(t)?),
         Type::Named(n) => format!("R_{n}"),
