@@ -695,7 +695,7 @@ impl Emitter<'_> {
                 let len = self.length(xs, env)?;
                 let out = self.fresh();
                 self.line(format!("var {out}:{};if({idx}<{len}){{", wg(t)?));
-                let v = self.element(xs, &idx, env)?;
+                let v = self.element_as(xs, &idx, env, Some(t))?;
                 self.line(format!("{out}={v};}}else{{"));
                 let v = self.scalar(&a[1], env, t)?;
                 self.line(format!("{out}={v};}}"));
@@ -949,21 +949,27 @@ impl Emitter<'_> {
         }
     }
     fn element(&mut self, e: &Expr, index: &str, env: &Env) -> LangResult<String> {
+        self.element_as(e, index, env, None)
+    }
+    // Literal callbacks inherit the checked result carrier. Re-inferring a
+    // number-only branch without its context can silently select U64 here.
+    fn element_as(&mut self, e: &Expr, index: &str, env: &Env, want: Option<&Type>) -> LangResult<String> {
         if self.depth >= 48 {
             return Err("GPU collection lowering depth budget".into());
         }
         self.depth += 1;
-        let r = self.element_inner(e, index, env);
+        let r = self.element_inner(e, index, env, want);
         self.depth -= 1;
         r
     }
-    fn element_inner(&mut self, e: &Expr, index: &str, env: &Env) -> LangResult<String> {
+    fn element_inner(&mut self, e: &Expr, index: &str, env: &Env, want: Option<&Type>) -> LangResult<String> {
+        let list = want.map(|t| Type::List(Box::new(t.clone())));
         if let Expr::Call(n, a) = e {
             if n == "parallel_map" {
                 let Type::List(input) = check::infer(&a[0], &Self::types(env), self.p)? else {
                     unreachable!()
                 };
-                let Type::List(output) = check::infer(e, &Self::types(env), self.p)? else {
+                let Type::List(output) = check::infer_context(e, &Self::types(env), self.p, list.as_ref())? else {
                     unreachable!()
                 };
                 let v = self.element(&a[0], index, env)?;
@@ -979,12 +985,12 @@ impl Emitter<'_> {
             return Err("GPU collection emission budget".into());
         }
         self.budget -= 1;
-        if let Some((e, env)) = self.with_list_body(e, env)? {
-            return self.element(&e, index, &env);
-        }
-        let Type::List(et) = check::infer(e, &Self::types(env), self.p)? else {
+        let Type::List(et) = check::infer_context(e, &Self::types(env), self.p, list.as_ref())? else {
             return Err("GPU list type".into());
         };
+        if let Some((e, env)) = self.with_list_body(e, env)? {
+            return self.element_as(&e, index, &env, Some(&et));
+        }
         match e {
             Expr::Var(n) => {
                 let (slot, _) = env.get(n).ok_or("list binding")?;
@@ -994,21 +1000,23 @@ impl Emitter<'_> {
                 let c = self.scalar(&a[0], env, &Type::Bool)?;
                 let out = self.fresh();
                 self.line(format!("var {out}:{};if({c}){{", wg(&et)?));
-                let x = self.element(&a[1], index, env)?;
+                let x = self.element_as(&a[1], index, env, Some(&et))?;
                 self.line(format!("{out}={x};}}else{{"));
-                let x = self.element(&a[2], index, env)?;
+                let x = self.element_as(&a[2], index, env, Some(&et))?;
                 self.line(format!("{out}={x};}}"));
                 Ok(out)
             }
             Expr::Method(xs, n, a) => {
-                let Type::List(st) = check::infer(xs, &Self::types(env), self.p)? else {
+                let same_carrier = ["take", "drop", "scan", "filter", "sort"].contains(&n.as_str());
+                let source = same_carrier.then(|| Type::List(et.clone()));
+                let Type::List(st) = check::infer_context(xs, &Self::types(env), self.p, source.as_ref())? else {
                     return Err("list type".into());
                 };
-                if n == "take" { return self.element(xs, index, env); }
+                if n == "take" { return self.element_as(xs, index, env, Some(&st)); }
                 if n == "drop" {
                     let len = self.length(xs, env)?;
                     let count = self.scalar(&a[0], env, &Type::U32)?;
-                    return self.element(xs, &format!("({index}+min({len},{count}))"), env);
+                    return self.element_as(xs, &format!("({index}+min({len},{count}))"), env, Some(&st));
                 }
                 if n == "scan" {
                     let out = self.bind(
@@ -1025,7 +1033,7 @@ impl Emitter<'_> {
                     )?;
                     let i = self.fresh();
                     self.line(format!("for(var {i}=0u;{i}<={index};{i}++){{"));
-                    let v = self.element(xs, &i, env)?;
+                    let v = self.element_as(xs, &i, env, Some(&st))?;
                     let v = self.add("+", &out, &v, &et);
                     self.line(format!("{out}={v};}}"));
                     return Ok(out);
@@ -1037,7 +1045,7 @@ impl Emitter<'_> {
                     self.line(format!("var {out}:{};", wg(&et)?));
                     let i = self.fresh();
                     self.line(format!("for(var {i}=0u;{i}<{len};{i}++){{"));
-                    let v = self.element(xs, &i, env)?;
+                    let v = self.element_as(xs, &i, env, Some(&st))?;
                     let v = self.bind(&et, &v)?;
                     let keep = self.apply(&a[0], env, vec![(v.clone(), *st)], &Type::Bool)?;
                     self.line(format!(
@@ -1052,18 +1060,18 @@ impl Emitter<'_> {
                     let i = self.fresh();
                     let j = self.fresh();
                     self.line(format!("for(var {i}=0u;{i}<{len};{i}++){{"));
-                    let v = self.element(xs, &i, env)?;
+                    let v = self.element_as(xs, &i, env, Some(&st))?;
                     let v = self.bind(&et, &v)?;
                     let rank = self.bind(&Type::U32, "0u")?;
                     self.line(format!("for(var {j}=0u;{j}<{len};{j}++){{"));
-                    let other = self.element(xs, &j, env)?;
+                    let other = self.element_as(xs, &j, env, Some(&st))?;
                     let other = self.bind(&et, &other)?;
                     let less = self.add("<", &other, &v, &et);
                     let equal = self.add("==", &other, &v, &et);
                     self.line(format!("if({less}||({equal}&&{j}<{i})){{{rank}++;}}}}if({rank}=={index}){{{out}={v};break;}}}}"));
                     return Ok(out);
                 }
-                let v = self.element(xs, index, env)?;
+                let v = self.element_as(xs, index, env, Some(&st))?;
                 match n.as_str() {
                     "map" => self.apply(&a[0], env, vec![(v, *st)], &et),
                     "map_indexed" => {
@@ -1274,7 +1282,7 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
     em.line(format!(
         "if(i==0u){{output[0u]={length};}}if(i>={length}){{return;}}"
     ));
-    let v = em.element(&f.body, "i", &env)?;
+    let v = em.element_as(&f.body, "i", &env, Some(et))?;
     let v = em.bind(et, &v)?;
     em.line(store(
         et,

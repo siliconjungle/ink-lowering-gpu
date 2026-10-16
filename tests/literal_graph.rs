@@ -213,3 +213,24 @@ fn standalone_ordered_and_aggregate_contexts_select_packed_graph_abi() {
         1
     );
 }
+
+#[test]
+fn direct_and_graph_callbacks_preserve_contextual_literal_carriers() {
+    let e=emit("module Context;
+        fn classify(xs:List<f32>)->List<u32>{return xs.map(fn(x)=>choose(is_nan(x),1,choose(is_finite(-x),2,3)));}
+        fn floats(xs:List<u32>)->List<f32>{return xs.map(fn(x)=>choose(x>0,1,2));}
+        fn signed(xs:List<u32>)->List<i32>{return xs.map(fn(x)=>choose(x>0,-1,2));}
+        fn wide(xs:List<u32>)->List<u64>{return xs.map(fn(x)=>choose(x>0,1,4294967296));}
+        fn filtered(xs:List<f32>)->List<u32>{return classify(xs).filter(fn(x)=>x>0).take(7).drop(1);}
+        fn ordered(xs:List<f32>)->List<u32>{return classify(xs).sort().scan();}
+        fn helper(xs:List<f32>)->List<u32>{return classify(xs);}");
+    for f in e.manifest["functions"].as_array().unwrap() {
+        assert!(f["shader"].is_string(), "{}: {}",f["name"],f["fallback_reason"]);
+        assert!(f["graph"].is_object(), "{}: {}",f["name"],f["fallback_reason"]);
+    }
+    for (name,source) in &e.shaders {
+        let module=naga::front::wgsl::parse_str(source).unwrap_or_else(|error|panic!("{name}: {}",error.emit_to_string(source)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(),naga::valid::Capabilities::all())
+            .validate(&module).unwrap_or_else(|error|panic!("{name}: {error}"));
+    }
+}
