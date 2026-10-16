@@ -1,6 +1,17 @@
 //! Literal fixed-width word operations; no rewrite or profitability decisions.
 use ink_core::{core::Type, LangResult};
 pub fn expression(name: &str, args: &[String], ty: &Type) -> LangResult<String> {
+    if let Some((_, result)) = ink_core::word::conversion(name) {
+        if args.len() != 1 || ty != &result {
+            return Err("GPU word conversion type or arity".into());
+        }
+        let value = &args[0];
+        return Ok(if result == Type::U64 {
+            format!("InkU64({value},0u)")
+        } else {
+            format!("({value}).lo")
+        });
+    }
     if !matches!(ty, Type::U32 | Type::U64 | Type::I32) || args.len() != if name == "word_not" { 1 } else { 2 } {
         return Err("GPU word operation type or arity".into());
     }
