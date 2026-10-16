@@ -148,11 +148,10 @@ fn sharing_and_capture_bounds_do_not_change_variable_scopes() {
         .unwrap()
         .iter()
         .any(|r| r == &json!({"param":0})));
-    assert!(last["args"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| r.get("node").is_some()));
+    // The sibling Let stays in a single scalar statement block; its shadow
+    // cannot replace the original input used by the right operand.
+    assert_eq!(scope["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(last["args"], json!([{"param":0}]));
     for n in e.manifest["functions"][1]["graph"]["nodes"]
         .as_array()
         .unwrap()

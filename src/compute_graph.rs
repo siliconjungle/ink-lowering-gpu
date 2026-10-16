@@ -1,4 +1,5 @@
-//! Literal materialized stage graph. No rewrite, fusion, or reduction reassociation.
+//! Literal collection stages and grouped scalar statements. No algebraic rewrite
+//! or reduction reassociation.
 use super::*;
 #[derive(Clone)]
 struct Ref {
@@ -72,6 +73,42 @@ fn free_vars(
     );
 }
 
+// Only group expressions with no collection work, including through callees.
+// This is target scheduling, not an equality or a license to skip evaluation.
+// The existing statement emitter still binds arguments/lets in source order.
+fn scalar_statements(e: &Expr, p: &Program) -> bool {
+    let mut pending = vec![e];
+    let mut callees = std::collections::BTreeSet::new();
+    let mut remaining = 10000usize;
+    while let Some(e) = pending.pop() {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        match e {
+            Expr::Method(..) => return false,
+            Expr::Call(n, _) => {
+                if ["list", "length", "sum", "count", "foldr", "foldl", "fold_until"]
+                    .contains(&n.as_str())
+                {
+                    return false;
+                }
+                if callees.insert(n.as_str()) {
+                    if let Some(f) = p.functions.iter().find(|f| &f.name == n) {
+                        if matches!(f.result, Type::List(_)) {
+                            return false;
+                        }
+                        pending.push(&f.body);
+                    }
+                }
+            }
+            _ => {}
+        }
+        pending.extend(ink_core::analysis::children(e));
+    }
+    true
+}
+
 impl Graph<'_> {
     fn types(env: &GraphEnv) -> check::Env {
         env.iter().map(|(n, r)| (n.clone(), r.ty.clone())).collect()
@@ -101,6 +138,14 @@ impl Graph<'_> {
         let ty = check::infer_context(e, &Self::types(env), self.p, want)?;
         if let Expr::Var(n) = e {
             return env.get(n).cloned().ok_or("unknown graph binding".into());
+        }
+        if !matches!(ty, Type::List(_)) && scalar_statements(e, self.p) {
+            // Scalar node construction is transactional: it publishes neither
+            // shaders nor nodes until statement emission succeeds. Retain the
+            // ordinary staged path when a larger statement exceeds its bounds.
+            if let Ok(value) = self.node("scalar", &ty, env, vec![], Some(e), None, None) {
+                return Ok(value);
+            }
         }
         if let Expr::Let(n, annotation, x, b) = e {
             let xt = check::infer_context(x, &Self::types(env), self.p, annotation.as_deref())?;
