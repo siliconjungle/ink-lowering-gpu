@@ -720,7 +720,19 @@ pub(super) fn lower(
         depth: 0,
         alias: 0,
     };
-    let out = g.walk(&f.body, &env, Some(&f.result))?;
+    let out = match g.walk(&f.body, &env, Some(&f.result)) {
+        Ok(out) => out,
+        Err(reason) if scalar_result(&f.result) && heavy(&f.body,p,&mut std::collections::BTreeSet::new())==0 => {
+            // Internal owners need not become graph/host intermediates. When a
+            // staged decomposition is unavailable, run the complete scalar body
+            // through the same bounded literal emitter. Keep lazy control inside
+            // that shader and preserve direct filter/scan/sort work restrictions.
+            g.nodes.clear();g.shaders.clear();
+            g.node("scalar",&f.result,&env,vec![],Some(&f.body),None,None)
+                .map_err(|fallback|format!("{reason}; literal scalar: {fallback}"))?
+        }
+        Err(reason) => return Err(reason),
+    };
     // Full u64 arithmetic uses exact two-lane helpers in literal stages.
     Ok((
         json!({"schema":1,"nodes":g.nodes,"output":out.id,"result":desc(&f.result,p)?,"semantics":"eager array stages; integer scans/sums (exactly wrapping), stable filters, integer radix sorts and concatenation run as parallel multi-pass schedules; float scans/sums, foldr, foldl and fold_until keep their ordered serial stage; no float reassociation or fusion","limitations":["bounded 64 stages and 24 traversal depth","parallel schedules support capacities up to 256^3 elements","ordered float reductions and folds run serially","exact integer-lane binary32; canonical arithmetic NaN","feedback requires matching bounded capacities and all stages to have graph descriptors"]}),

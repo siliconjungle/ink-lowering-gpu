@@ -68,7 +68,7 @@ fn balanced_scalar_calls_keep_one_stage_and_valid_exact_word_shaders() {
 }
 
 #[test]
-fn transitive_collection_callees_retain_eager_stages_and_lazy_fallback() {
+fn transitive_collections_keep_eager_stages_and_lazy_scalar_control() {
     let e = emission("module CollectionBoundaries;fn inner(xs:List<u32>)->u32{return sum(xs.map(fn(x)=>x+1));}fn middle(xs:List<u32>)->u32{return inner(xs);}fn outer(xs:List<u32>)->u32{return middle(xs)+7;}fn guarded(xs:List<u32>,c:Bool)->u32{return choose(c,inner(xs),9);}");
     let outer = function(&e, "outer");
     let ops: Vec<_> = outer["graph"]["nodes"]
@@ -78,5 +78,11 @@ fn transitive_collection_callees_retain_eager_stages_and_lazy_fallback() {
         .map(|n| n["op"].as_str().unwrap())
         .collect();
     assert_eq!(ops, ["map", "sum", "scalar"]);
-    assert!(function(&e, "guarded")["graph"].is_null());
+    let guarded=function(&e,"guarded");
+    assert!(guarded["fallback_reason"].is_null());
+    let nodes=guarded["graph"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(),1);assert_eq!(nodes[0]["op"],"scalar");
+    let code=&e.shaders[nodes[0]["shader"].as_str().unwrap()];
+    let module=naga::front::wgsl::parse_str(code).unwrap();
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(),naga::valid::Capabilities::empty()).validate(&module).unwrap();
 }

@@ -108,13 +108,16 @@ fn materializes_each_literal_stage_and_ordered_reducer() {
     }
 }
 #[test]
-fn lazy_collection_branches_are_explicit_fallback_and_scalar_choices_stay_lazy() {
+fn lazy_scalar_collections_remain_inside_one_conditional_shader() {
     let e=emit("module Lazy;fn lazy(xs:List<u32>,c:Bool)->u32{return choose(c,sum(xs.map(fn(x)=>x*7)),9);} fn scalar(xs:List<u32>,k:u32)->List<u32>{return xs.map(fn(x)=>choose(x<k,quot_or(x,0,7),x+1)).map(fn(x)=>x);}");
-    assert!(e.manifest["functions"][0]["graph"].is_null());
-    assert!(e.manifest["functions"][0]["fallback_reason"]
-        .as_str()
-        .unwrap()
-        .contains("lazy collection"));
+    let lazy=&e.manifest["functions"][0];
+    assert!(lazy["fallback_reason"].is_null());
+    assert_eq!(lazy["graph"]["nodes"].as_array().unwrap().len(),1);
+    assert_eq!(lazy["graph"]["nodes"][0]["op"],"scalar");
+    for code in e.shaders.values() {
+        let module=naga::front::wgsl::parse_str(code).unwrap();
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(),naga::valid::Capabilities::all()).validate(&module).unwrap();
+    }
     let g = &e.manifest["functions"][1]["graph"];
     let code = &e.shaders[g["nodes"][0]["shader"].as_str().unwrap()];
     assert!(code.contains("if ("));

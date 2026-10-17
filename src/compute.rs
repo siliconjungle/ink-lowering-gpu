@@ -736,6 +736,7 @@ impl Emitter<'_> {
                 let len = self.length(&a[0], env)?;
                 let initial = self.scalar(&a[1], env, t)?;
                 let out = self.bind(t, &initial)?;
+                let initial_bound = self.buffers.get(&out).cloned();
                 let i = self.fresh();
                 self.line(format!("for(var {i}=0u;{i}<{len};{i}++){{"));
                 let item = self.element(&a[0], &i, env)?;
@@ -746,6 +747,7 @@ impl Emitter<'_> {
                 let stop = self.apply(&a[2], env, values.clone(), &Type::Bool)?;
                 let stop = self.bind(&Type::Bool, &stop)?;
                 let value = self.apply(&a[3], env, values, t)?;
+                self.loop_buffer_bound(initial_bound, &out, &value)?;
                 self.line(format!("{out}={value};if({stop}){{break;}}}}"));
                 Ok(out)
             }
@@ -766,6 +768,7 @@ impl Emitter<'_> {
                     self.scalar(&a[1], env, t)?
                 };
                 let out = self.bind(t, &init)?;
+                let initial_bound = self.buffers.get(&out).cloned();
                 let i = self.fresh();
                 self.line(if n == "sum" || n == "foldl" {
                     format!("for(var {i}=0u;{i}<{len};{i}++){{")
@@ -781,6 +784,7 @@ impl Emitter<'_> {
                     };
                     self.apply(&a[2], env, vec![(item, *et), (out.clone(), t.clone())], t)?
                 };
+                self.loop_buffer_bound(initial_bound, &out, &v)?;
                 self.line(format!("{out}={v};}}"));
                 Ok(out)
             }
@@ -1433,10 +1437,21 @@ fn heavy_limit(level: u8) -> Option<u32> {
     }
 }
 pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> {
+    lower_filtered(checked, None)
+}
+/// Keep internal typed helpers in the checked program, exposing only the chosen
+/// entry through the packed ABI. Eligibility still examines all executed work.
+pub fn lower_entry(checked: &core::CheckedModule, entry: &str) -> LangResult<crate::gpu::Emission> {
+    lower_filtered(checked, Some(entry))
+}
+fn lower_filtered(checked: &core::CheckedModule, entry: Option<&str>) -> LangResult<crate::gpu::Emission> {
     let p = checked.pure_program()?;
+    if entry.is_some_and(|name| !p.functions.iter().any(|f| f.name == name)) {
+        return Err("unknown packed GPU entry function".into());
+    }
     let mut files = BTreeMap::new();
     let mut functions = Vec::new();
-    for (i, f) in p.functions.iter().enumerate() {
+    for (i, f) in p.functions.iter().enumerate().filter(|(_,f)|entry.map_or(true,|name|f.name==name)) {
         let guard=p.contracts.precondition_checks.get(&f.name);
         let declarations = if guard.is_some() {
             Err("contract precondition ingress uses the CPU host".to_owned())
