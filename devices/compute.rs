@@ -1288,7 +1288,13 @@ pub(super) fn graph_capacity(graph: &Value, arguments: &[usize]) -> Result<(Vec<
             Some("one") => 1,
             Some("same") => *values.first().ok_or("missing same capacity")?,
             Some("min") => *values.iter().min().ok_or("missing min capacity")?,
-            Some("max") => *values.iter().max().ok_or("missing max capacity")?,
+            Some("max") => {
+                let floor=match node["capacity"].get("floor") {
+                    None=>0,
+                    Some(value)=>usize::try_from(value.as_u64().ok_or("invalid capacity floor")?).map_err(|_|"capacity floor overflow")?,
+                };
+                (*values.iter().max().ok_or("missing max capacity")?).max(floor)
+            },
             Some("sum") => values.iter().try_fold(0usize, |a, b| {
                 a.checked_add(*b).ok_or("graph capacity overflow")
             })?,

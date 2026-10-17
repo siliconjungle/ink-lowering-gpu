@@ -49,10 +49,19 @@ pub fn needed(p: &Program) -> bool {
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 type Env = BTreeMap<String, (String, Type)>;
+#[derive(Default)]
+struct CapacityBound { fixed: usize, slots: Vec<usize> }
+impl CapacityBound {
+    fn union(mut self, other: Self) -> Self {
+        self.fixed=self.fixed.max(other.fixed);self.slots.extend(other.slots);self
+    }
+}
 #[path = "compute_graph.rs"]
 mod graph;
 #[path = "parallel.rs"]
 mod parallel;
+#[path = "private_values.rs"]
+mod private_values;
 
 fn wg(t: &Type) -> LangResult<String> {
     Ok(match t {
@@ -64,14 +73,7 @@ fn wg(t: &Type) -> LangResult<String> {
         Type::Bool => "bool".into(),
         Type::Vector(t, n) => format!("vec{n}<{}>", wg(t)?),
         Type::Named(n) => format!("R_{n}"),
-        Type::Buffer(inner)
-            if matches!(
-                inner.as_ref(),
-                Type::U32 | Type::U64 | Type::I32 | Type::F32 | Type::Bool
-            ) =>
-        {
-            format!("InkBuffer_{}", wg(inner)?)
-        }
+        Type::Buffer(inner) => private_values::buffer_name(inner)?,
         _ => {
             return Err("GPU scalar requires a 32-bit numeric, Bool, vector or flat record".into())
         }
@@ -96,6 +98,16 @@ fn local_layout(t: &Type, p: &Program, depth: usize, budget: &mut usize) -> Lang
         Type::U64 => Ok((1, 2)),
         Type::Vector(inner, n) if matches!(inner.as_ref(), Type::U32 | Type::I32 | Type::F32 | Type::Bool) =>
             Ok((if *n == 2 { 2 } else { 4 }, *n as usize)),
+        Type::Buffer(inner) => {
+            let (alignment, size) = local_layout(inner, p, depth + 1, budget)?;
+            lanes(inner, p, true)?; // Owned/nested variable-width elements remain unsupported.
+            let stride = size.checked_add(alignment - 1).map(|n| n / alignment * alignment)
+                .ok_or("GPU private buffer layout overflow")?;
+            let size = stride.checked_mul(64).and_then(|n|n.checked_add(1))
+                .and_then(|n|n.checked_add(alignment - 1)).map(|n|n/alignment*alignment)
+                .ok_or("GPU private buffer layout overflow")?;
+            Ok((alignment, size))
+        }
         Type::Named(name) => {
             let mut alignment = 1;
             let mut size = 0usize;
@@ -154,7 +166,7 @@ struct Emitter<'a> {
     depth: usize,
     views: Vec<(Expr, Env)>,
     local_lists: BTreeMap<String, (String, usize)>,
-    local_list_words: usize,
+    private: private_values::Private,
     buffers: BTreeMap<String, BufferBound>,
 }
 impl Emitter<'_> {
@@ -181,11 +193,8 @@ impl Emitter<'_> {
         let n = self.fresh();
         let ty = self.ty(t)?;
         self.line(format!("var {n}:{ty}={v};"));
-        if matches!(t, Type::Buffer(_)) {
-            let bound = self.buffer_bound(v)?;
-            self.buffers.insert(n.clone(), bound);
-        }
-
+        self.reserve_private(t)?;
+        self.inherit_bounds(t, v, &n)?;
         Ok(n)
     }
     fn buffer_bound(&self, value: &str) -> LangResult<BufferBound> {
@@ -193,24 +202,6 @@ impl Emitter<'_> {
             .get(value)
             .cloned()
             .ok_or("GPU temporary buffer has no static bound".into())
-    }
-    fn loop_buffer_bound(
-        &mut self,
-        initial: Option<BufferBound>,
-        out: &str,
-        step: &str,
-    ) -> LangResult<()> {
-        if let Some(initial) = initial {
-            let step = self.buffer_bound(step)?;
-            // Maintaining a partition bound requires preserving its provenance;
-            // an independently filled buffer of the same maximum can be longer
-            // than the actual partition. Fixed owners may shrink freely.
-            if initial != step && !matches!(initial, BufferBound::Fixed(n) if step.upper() <= n) {
-                return Err("GPU temporary loop may grow its buffer bound; CPU fallback".into());
-            }
-            self.buffers.insert(out.into(), initial);
-        }
-        Ok(())
     }
     fn add(&self, op: &str, a: &str, b: &str, t: &Type) -> String {
         if let Type::Vector(inner, n) = t {
@@ -349,20 +340,7 @@ impl Emitter<'_> {
                     }
                 ))
             }
-            Expr::Record(n, fields) => {
-                let schema = self.p.records[n].clone();
-                let mut xs = Vec::new();
-                for (k, t) in &schema {
-                    let e = &fields
-                        .iter()
-                        .find(|(f, _)| f == k)
-                        .ok_or("record field missing")?
-                        .1;
-                    let a = self.scalar(e, env, t)?;
-                    xs.push(self.bind(t, &a)?);
-                }
-                Ok(format!("R_{n}({})", xs.join(",")))
-            }
+            Expr::Record(n, fields) => self.construct_record(n,fields,env,t),
             Expr::Binary(op, a, b) => {
                 let ot = if check::is_number(t) {
                     t.clone()
@@ -408,33 +386,7 @@ impl Emitter<'_> {
                 let values=a.iter().zip(params).map(|(a,t)|self.scalar(a,env,&t)).collect::<LangResult<Vec<_>>>()?;
                 crate::primitive_emit::expression(n,&values,first.as_ref())
             }
-            Expr::Call(n, a) if n == "choose" => {
-                let c = self.scalar(&a[0], env, &Type::Bool)?;
-                let out = self.fresh();
-                let ty = self.ty(t)?;
-                let before = self.buffers.clone();
-                self.line(format!("var {out}:{ty};"));
-                self.line(format!("if ({c}) {{"));
-                let x = self.scalar(&a[1], env, t)?;
-                let xb = self.buffers.get(&x).cloned();
-                self.line(format!("{out}={x};\n}} else {{"));
-                self.buffers = before.clone();
-                let y = self.scalar(&a[2], env, t)?;
-                let yb = self.buffers.get(&y).cloned();
-                self.line(format!("{out}={y};\n}}"));
-                self.buffers = before;
-                if matches!(t, Type::Buffer(_)) {
-                    let x = xb.ok_or("GPU branch buffer bound")?;
-                    let y = yb.ok_or("GPU branch buffer bound")?;
-                    let merged = if x == y {
-                        x
-                    } else {
-                        BufferBound::Fixed(x.upper().max(y.upper()))
-                    };
-                    self.buffers.insert(out.clone(), merged);
-                }
-                Ok(out)
-            }
+            Expr::Call(n, a) if n == "choose" => self.choose_value(a,env,t),
             Expr::Call(n, a) if ["vec2", "vec3", "vec4"].contains(&n.as_str()) => {
                 let Type::Vector(et, _) = t else {
                     return Err("vector type missing".into());
@@ -458,14 +410,14 @@ impl Emitter<'_> {
                 };
                 let x = self.scalar(&a[1], env, t)?;
                 let out = self.bind(t, &x)?;
-                let initial_bound = self.buffers.get(&out).cloned();
+                let initial_bound = self.owned_bounds(t, &out)?;
                 let idx = self.fresh();
                 self.line(format!("for(var {idx}=0u;{idx}<{bound}u;{idx}++){{"));
                 let mut local = env.clone();
                 local.insert(i.clone(), (idx, Type::U32));
                 local.insert(acc.clone(), (out.clone(), t.clone()));
                 let v = self.scalar(b, &local, t)?;
-                self.loop_buffer_bound(initial_bound, &out, &v)?;
+                self.loop_buffer_bounds(initial_bound, &out, &v)?;
                 self.line(format!("{out}={v};\n}}"));
                 Ok(out)
             }
@@ -476,6 +428,7 @@ impl Emitter<'_> {
                 let y = self.bind(t, &y)?;
                 let out = self.fresh();
                 let ty = self.ty(t)?;
+                self.reserve_private(t)?;
                 self.line(format!("var {out}:{ty};"));
                 let overflow = if *t == Type::I32 {
                     format!(" || ({x}=={} && {y}==-1)", { "bitcast<i32>(2147483648u)" })
@@ -520,6 +473,7 @@ impl Emitter<'_> {
                 let value = self.bind(inner, &value)?;
                 let out = self.fresh();
                 let i = self.fresh();
+                self.reserve_private(t)?;
                 self.line(format!("var {out}:{};{out}.length={size}u;for(var {i}=0u;{i}<{size}u;{i}++){{{out}.data[{i}]={value};}}",wg(t)?));
                 self.buffers
                     .insert(out.clone(), BufferBound::Fixed(size as u32));
@@ -535,7 +489,7 @@ impl Emitter<'_> {
                 };
                 let initial = self.scalar(&a[1], env, t)?;
                 let out = self.bind(t, &initial)?;
-                let initial_bound = self.buffers.get(&out).cloned();
+                let initial_bound = self.owned_bounds(t, &out)?;
                 let i = self.fresh();
                 self.line(format!("for(var {i}=0u;{i}<{limit}u;{i}++){{"));
                 let stop = self.apply(&a[2], env, vec![(out.clone(), t.clone())], &Type::Bool)?;
@@ -546,7 +500,7 @@ impl Emitter<'_> {
                     vec![(i, Type::U32), (out.clone(), t.clone())],
                     t,
                 )?;
-                self.loop_buffer_bound(initial_bound, &out, &step)?;
+                self.loop_buffer_bounds(initial_bound, &out, &step)?;
                 self.line(format!("{out}={step};}}"));
                 Ok(out)
             }
@@ -554,6 +508,7 @@ impl Emitter<'_> {
                 if matches!(xs.as_ref(), Expr::Var(v) if v == "Buffer") && n == "empty" =>
             {
                 let out = self.fresh();
+                self.reserve_private(t)?;
                 self.line(format!("var {out}:{};{out}.length=0u;", wg(t)?));
                 self.buffers.insert(out.clone(), BufferBound::Fixed(0));
                 Ok(out)
@@ -563,163 +518,7 @@ impl Emitter<'_> {
                     check::infer(xs, &Self::types(env), self.p)?,
                     Type::Buffer(_)
                 ) =>
-            {
-                let xt = check::infer(xs, &Self::types(env), self.p)?;
-                let Type::Buffer(inner) = &xt else {
-                    unreachable!()
-                };
-                let b = self.scalar(xs, env, &xt)?;
-                if n == "len" {
-                    return Ok(format!("{b}.length"));
-                }
-                if n == "pop" {
-                    self.line(format!("if({b}.length>0u){{{b}.length--;}}"));
-                    return Ok(b);
-                }
-                if n == "split_at" {
-                    let at = self.scalar(&a[0], env, &Type::U32)?;
-                    let at = self.bind(&Type::U32, &at)?;
-                    let left = self.fresh();
-                    let right = self.fresh();
-                    let i = self.fresh();
-                    let parent = self.buffer_bound(&b)?;
-                    let partition = self.next; // fresh owner identity, never a source-name alias
-                    self.line(format!("var {left}:{};var {right}:{};{left}.length=min({at},{b}.length);{right}.length={b}.length-{left}.length;", wg(&xt)?, wg(&xt)?));
-                    self.line(format!("for(var {i}=0u;{i}<{left}.length;{i}++){{{left}.data[{i}]={b}.data[{i}];}}"));
-                    let j = self.fresh();
-                    self.line(format!("for(var {j}=0u;{j}<{right}.length;{j}++){{{right}.data[{j}]={b}.data[{left}.length+{j}];}}"));
-                    self.buffers.insert(
-                        left.clone(),
-                        BufferBound::Partition(Box::new(parent.clone()), partition, false),
-                    );
-                    self.buffers.insert(
-                        right.clone(),
-                        BufferBound::Partition(Box::new(parent), partition, true),
-                    );
-                    return self.apply(
-                        &a[1],
-                        env,
-                        vec![(left, xt.clone()), (right, xt.clone())],
-                        &xt,
-                    );
-                }
-                if n == "append" {
-                    let other = self.scalar(&a[0], env, &xt)?;
-                    let bound = self.buffer_bound(&b)?.append(&self.buffer_bound(&other)?);
-                    if bound.upper() > 64 {
-                        return Err(
-                            "GPU temporary append capacity exceeds 64 elements; CPU fallback"
-                                .into(),
-                        );
-                    }
-                    let i = self.fresh();
-                    self.line(format!("for(var {i}=0u;{i}<{other}.length;{i}++){{{b}.data[{b}.length+{i}]={other}.data[{i}];}}{b}.length+={other}.length;"));
-                    self.buffers.insert(b.clone(), bound);
-                    return Ok(b);
-                }
-                if n == "push" {
-                    let upper = self.buffer_bound(&b)?.upper() + 1;
-                    if upper > 64 {
-                        return Err(
-                            "GPU temporary push capacity exceeds 64 elements; CPU fallback".into(),
-                        );
-                    }
-                    let value = self.scalar(&a[0], env, inner)?;
-                    self.line(format!("{b}.data[{b}.length]={value};{b}.length++;"));
-                    self.buffers.insert(b.clone(), BufferBound::Fixed(upper));
-                    return Ok(b);
-                }
-                if n == "filter" {
-                    let i = self.fresh();
-                    let kept = self.fresh();
-                    self.line(format!(
-                        "var {kept}=0u;for(var {i}=0u;{i}<{b}.length;{i}++){{"
-                    ));
-                    let item = self.bind(inner, &format!("{b}.data[{i}]"))?;
-                    let pred = self.apply(
-                        &a[0],
-                        env,
-                        vec![(item.clone(), *inner.clone())],
-                        &Type::Bool,
-                    )?;
-                    self.line(format!(
-                        "if({pred}){{{b}.data[{kept}]={item};{kept}++;}}}}{b}.length={kept};"
-                    ));
-                    return Ok(b);
-                }
-                if ["map", "map_indexed", "scan"].contains(&n.as_str()) {
-                    let i = self.fresh();
-                    let acc = self.fresh();
-                    if n == "scan" {
-                        self.line(format!("var {acc}:{}=0;", self.ty(inner)?));
-                    }
-                    self.line(format!("for(var {i}=0u;{i}<{b}.length;{i}++){{"));
-                    let item = format!("{b}.data[{i}]");
-                    let value = if n == "scan" {
-                        self.line(format!("{acc}={acc}+{item};"));
-                        acc
-                    } else {
-                        let params = if n == "map" {
-                            vec![(item, *inner.clone())]
-                        } else {
-                            vec![(i.clone(), Type::U32), (item, *inner.clone())]
-                        };
-                        self.apply(&a[0], env, params, inner)?
-                    };
-                    self.line(format!("{b}.data[{i}]={value};}}"));
-                    return Ok(b);
-                }
-                if n == "map_parallel" {
-                    self.scalar(&a[0], env, &Type::U32)?;
-                    let i = self.fresh();
-                    self.line(format!("for(var {i}=0u;{i}<{b}.length;{i}++){{"));
-                    let value = self.apply(
-                        &a[1],
-                        env,
-                        vec![
-                            (i.clone(), Type::U32),
-                            (format!("{b}.data[{i}]"), *inner.clone()),
-                        ],
-                        inner,
-                    )?;
-                    self.line(format!("{b}.data[{i}]={value};}}"));
-                    return Ok(b);
-                }
-                if !["at_or", "set", "swap", "truncate"].contains(&n.as_str()) {
-                    return Err("GPU temporary method uses CPU fallback".into());
-                };
-                let i = self.scalar(&a[0], env, &Type::U32)?;
-                let i = self.bind(&Type::U32, &i)?;
-                match n.as_str() {
-                    "at_or" => {
-                        let out = self.fresh();
-                        self.line(format!(
-                            "var {out}:{};if({i}<{b}.length){{{out}={b}.data[{i}];}}else{{",
-                            wg(inner)?
-                        ));
-                        let value = self.scalar(&a[1], env, inner)?;
-                        self.line(format!("{out}={value};}}"));
-                        Ok(out)
-                    }
-                    "set" => {
-                        let value = self.scalar(&a[1], env, inner)?;
-                        self.line(format!("if({i}<{b}.length){{{b}.data[{i}]={value};}}"));
-                        Ok(b)
-                    }
-                    "swap" => {
-                        let j = self.scalar(&a[1], env, &Type::U32)?;
-                        let j = self.bind(&Type::U32, &j)?;
-                        let tmp = self.fresh();
-                        self.line(format!("if({i}<{b}.length&&{j}<{b}.length){{let {tmp}={b}.data[{i}];{b}.data[{i}]={b}.data[{j}];{b}.data[{j}]={tmp};}}"));
-                        Ok(b)
-                    }
-                    "truncate" => {
-                        self.line(format!("{b}.length=min({b}.length,{i});"));
-                        Ok(b)
-                    }
-                    _ => unreachable!(),
-                }
-            }
+            { self.buffer_method(xs,n,a,env) }
             Expr::Method(xs, n, a) if n == "at_or" => {
                 let idx = self.scalar(&a[0], env, &Type::U32)?;
                 let idx = self.bind(&Type::U32, &idx)?;
@@ -736,7 +535,7 @@ impl Emitter<'_> {
                 let len = self.length(&a[0], env)?;
                 let initial = self.scalar(&a[1], env, t)?;
                 let out = self.bind(t, &initial)?;
-                let initial_bound = self.buffers.get(&out).cloned();
+                let initial_bound = self.owned_bounds(t, &out)?;
                 let i = self.fresh();
                 self.line(format!("for(var {i}=0u;{i}<{len};{i}++){{"));
                 let item = self.element(&a[0], &i, env)?;
@@ -747,7 +546,7 @@ impl Emitter<'_> {
                 let stop = self.apply(&a[2], env, values.clone(), &Type::Bool)?;
                 let stop = self.bind(&Type::Bool, &stop)?;
                 let value = self.apply(&a[3], env, values, t)?;
-                self.loop_buffer_bound(initial_bound, &out, &value)?;
+                self.loop_buffer_bounds(initial_bound, &out, &value)?;
                 self.line(format!("{out}={value};if({stop}){{break;}}}}"));
                 Ok(out)
             }
@@ -768,7 +567,7 @@ impl Emitter<'_> {
                     self.scalar(&a[1], env, t)?
                 };
                 let out = self.bind(t, &init)?;
-                let initial_bound = self.buffers.get(&out).cloned();
+                let initial_bound = self.owned_bounds(t, &out)?;
                 let i = self.fresh();
                 self.line(if n == "sum" || n == "foldl" {
                     format!("for(var {i}=0u;{i}<{len};{i}++){{")
@@ -784,7 +583,7 @@ impl Emitter<'_> {
                     };
                     self.apply(&a[2], env, vec![(item, *et), (out.clone(), t.clone())], t)?
                 };
-                self.loop_buffer_bound(initial_bound, &out, &v)?;
+                self.loop_buffer_bounds(initial_bound, &out, &v)?;
                 self.line(format!("{out}={v};}}"));
                 Ok(out)
             }
@@ -818,6 +617,214 @@ impl Emitter<'_> {
             _ => Err("unsupported scalar compute expression".into()),
         }
     }
+    fn construct_record(&mut self,n:&String,fields:&[(String,Expr)],env:&Env,t:&Type)->LangResult<String>{
+        let schema = self.p.records[n].clone();
+        let mut xs = Vec::new();
+        for (k, t) in &schema {
+            let e = &fields
+                .iter()
+                .find(|(f, _)| f == k)
+                .ok_or("record field missing")?
+                .1;
+            let a = self.scalar(e, env, t)?;
+            xs.push(self.bind(t, &a)?);
+        }
+        let value = format!("R_{n}({})", xs.join(","));
+        let mut owned = false;
+        for ((field, ty), child) in schema.iter().zip(&xs) {
+            for (mut path, bound) in self.owned_bounds(ty, child)? {
+                path.insert(0, field.clone());
+                self.buffers.insert(private_values::project(&value, &path), bound);
+                owned = true;
+            }
+        }
+        // Owners need an addressable private record before projection.
+        if owned { self.bind(t, &value) } else { Ok(value) }
+    }
+    fn choose_value(&mut self,a:&[Expr],env:&Env,t:&Type)->LangResult<String>{
+        let c = self.scalar(&a[0], env, &Type::Bool)?;
+        let out = self.fresh();
+        let ty = self.ty(t)?;
+        let before = self.snapshot_buffer_bounds()?;
+        self.reserve_private(t)?;
+        self.line(format!("var {out}:{ty};"));
+        self.line(format!("if ({c}) {{"));
+        let x = self.scalar(&a[1], env, t)?;
+        let xb = self.owned_bounds(t, &x)?;
+        self.line(format!("{out}={x};\n}} else {{"));
+        self.charge_bound_work(before.len())?;
+        self.buffers = before.clone();
+        let y = self.scalar(&a[2], env, t)?;
+        let yb = self.owned_bounds(t, &y)?;
+        self.line(format!("{out}={y};\n}}"));
+        self.buffers = before;
+        for (path, x) in xb {
+            let y = yb.get(&path).ok_or("GPU branch owner field missing")?;
+            let merged = if &x == y { x } else { BufferBound::Fixed(x.upper().max(y.upper())) };
+            self.buffers.insert(private_values::project(&out, &path), merged);
+        }
+        Ok(out)
+    }
+    fn buffer_method(&mut self,xs:&Expr,n:&String,a:&[Expr],env:&Env)->LangResult<String>{
+        let xt = check::infer(xs, &Self::types(env), self.p)?;
+        let Type::Buffer(inner) = &xt else {
+            unreachable!()
+        };
+        let b = self.scalar(xs, env, &xt)?;
+        if n == "len" {
+            return Ok(format!("{b}.length"));
+        }
+        if n == "pop" {
+            self.line(format!("if({b}.length>0u){{{b}.length--;}}"));
+            return Ok(b);
+        }
+        if n == "split_at" {
+            let at = self.scalar(&a[0], env, &Type::U32)?;
+            let at = self.bind(&Type::U32, &at)?;
+            let left = self.fresh();
+            let right = self.fresh();
+            let i = self.fresh();
+            let parent = self.buffer_bound(&b)?;
+            let partition = self.next; // fresh owner identity, never a source-name alias
+            self.reserve_private(&xt)?;
+            self.reserve_private(&xt)?;
+            self.line(format!("var {left}:{};var {right}:{};{left}.length=min({at},{b}.length);{right}.length={b}.length-{left}.length;", wg(&xt)?, wg(&xt)?));
+            self.line(format!("for(var {i}=0u;{i}<{left}.length;{i}++){{{left}.data[{i}]={b}.data[{i}];}}"));
+            let j = self.fresh();
+            self.line(format!("for(var {j}=0u;{j}<{right}.length;{j}++){{{right}.data[{j}]={b}.data[{left}.length+{j}];}}"));
+            self.buffers.insert(
+                left.clone(),
+                BufferBound::Partition(Box::new(parent.clone()), partition, false),
+            );
+            self.buffers.insert(
+                right.clone(),
+                BufferBound::Partition(Box::new(parent), partition, true),
+            );
+            return self.apply(
+                &a[1],
+                env,
+                vec![(left, xt.clone()), (right, xt.clone())],
+                &xt,
+            );
+        }
+        if n == "append" {
+            let other = self.scalar(&a[0], env, &xt)?;
+            let bound = self.buffer_bound(&b)?.append(&self.buffer_bound(&other)?);
+            if bound.upper() > 64 {
+                return Err(
+                    "GPU temporary append capacity exceeds 64 elements; CPU fallback"
+                        .into(),
+                );
+            }
+            let i = self.fresh();
+            self.line(format!("for(var {i}=0u;{i}<{other}.length;{i}++){{{b}.data[{b}.length+{i}]={other}.data[{i}];}}{b}.length+={other}.length;"));
+            self.buffers.insert(b.clone(), bound);
+            return Ok(b);
+        }
+        if n == "push" {
+            let upper = self.buffer_bound(&b)?.upper() + 1;
+            if upper > 64 {
+                return Err(
+                    "GPU temporary push capacity exceeds 64 elements; CPU fallback".into(),
+                );
+            }
+            let value = self.scalar(&a[0], env, inner)?;
+            self.line(format!("{b}.data[{b}.length]={value};{b}.length++;"));
+            self.buffers.insert(b.clone(), BufferBound::Fixed(upper));
+            return Ok(b);
+        }
+        if n == "filter" {
+            let i = self.fresh();
+            let kept = self.fresh();
+            self.line(format!(
+                "var {kept}=0u;for(var {i}=0u;{i}<{b}.length;{i}++){{"
+            ));
+            let item = self.bind(inner, &format!("{b}.data[{i}]"))?;
+            let pred = self.apply(
+                &a[0],
+                env,
+                vec![(item.clone(), *inner.clone())],
+                &Type::Bool,
+            )?;
+            self.line(format!(
+                "if({pred}){{{b}.data[{kept}]={item};{kept}++;}}}}{b}.length={kept};"
+            ));
+            return Ok(b);
+        }
+        if ["map", "map_indexed", "scan"].contains(&n.as_str()) {
+            let i = self.fresh();
+            let acc = self.fresh();
+            if n == "scan" {
+                let zero = match inner.as_ref() { Type::U64=>"InkU64(0u,0u)", Type::I32=>"0i", Type::F32|Type::U32=>"0u", _=>return Err("GPU temporary scan requires a supported numeric element".into()) };
+                self.line(format!("var {acc}:{}={zero};", self.ty(inner)?));
+            }
+            self.line(format!("for(var {i}=0u;{i}<{b}.length;{i}++){{"));
+            let item = format!("{b}.data[{i}]");
+            let value = if n == "scan" {
+                self.line(format!("{acc}={};", self.add("+", &acc, &item, inner)));
+                acc
+            } else {
+                let params = if n == "map" {
+                    vec![(item, *inner.clone())]
+                } else {
+                    vec![(i.clone(), Type::U32), (item, *inner.clone())]
+                };
+                self.apply(&a[0], env, params, inner)?
+            };
+            self.line(format!("{b}.data[{i}]={value};}}"));
+            return Ok(b);
+        }
+        if n == "map_parallel" {
+            self.scalar(&a[0], env, &Type::U32)?;
+            let i = self.fresh();
+            self.line(format!("for(var {i}=0u;{i}<{b}.length;{i}++){{"));
+            let value = self.apply(
+                &a[1],
+                env,
+                vec![
+                    (i.clone(), Type::U32),
+                    (format!("{b}.data[{i}]"), *inner.clone()),
+                ],
+                inner,
+            )?;
+            self.line(format!("{b}.data[{i}]={value};}}"));
+            return Ok(b);
+        }
+        if !["at_or", "set", "swap", "truncate"].contains(&n.as_str()) {
+            return Err("GPU temporary method uses CPU fallback".into());
+        };
+        let i = self.scalar(&a[0], env, &Type::U32)?;
+        let i = self.bind(&Type::U32, &i)?;
+        match n.as_str() {
+            "at_or" => {
+                let out = self.fresh();
+                self.line(format!(
+                    "var {out}:{};if({i}<{b}.length){{{out}={b}.data[{i}];}}else{{",
+                    wg(inner)?
+                ));
+                let value = self.scalar(&a[1], env, inner)?;
+                self.line(format!("{out}={value};}}"));
+                Ok(out)
+            }
+            "set" => {
+                let value = self.scalar(&a[1], env, inner)?;
+                self.line(format!("if({i}<{b}.length){{{b}.data[{i}]={value};}}"));
+                Ok(b)
+            }
+            "swap" => {
+                let j = self.scalar(&a[1], env, &Type::U32)?;
+                let j = self.bind(&Type::U32, &j)?;
+                let tmp = self.fresh();
+                self.line(format!("if({i}<{b}.length&&{j}<{b}.length){{let {tmp}={b}.data[{i}];{b}.data[{i}]={b}.data[{j}];{b}.data[{j}]={tmp};}}"));
+                Ok(b)
+            }
+            "truncate" => {
+                self.line(format!("{b}.length=min({b}.length,{i});"));
+                Ok(b)
+            }
+            _ => unreachable!(),
+        }
+    }
     fn list(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<String> {
         if self.depth >= 48 {
             return Err("GPU local collection lowering depth budget".into());
@@ -846,10 +853,10 @@ impl Emitter<'_> {
                     .ok_or("GPU local list size overflow")?;
                 let words = stride.checked_mul(items.len().max(1))
                     .ok_or("GPU local list size overflow")?;
-                if words > 4096usize.saturating_sub(self.local_list_words) {
+                if words > private_values::WORDS.saturating_sub(self.private.words) {
                     return Err("GPU local list storage budget exceeded; CPU fallback".into());
                 }
-                self.local_list_words += words;
+                self.private.words += words;
                 let array = self.fresh();
                 self.line(format!("var {array}:array<{},{}>;", wg(&et)?, items.len().max(1)));
                 // A source constructor is strict and evaluates its elements once,
@@ -863,7 +870,7 @@ impl Emitter<'_> {
                 return Ok(slot);
             }
         }
-        if let Some((body, local)) = self.with_list_body(e, env)? {
+        if let Some((body, local)) = self.with_list_body_as(e, env, want)? {
             return self.list(&body, &local, want);
         }
         let i = self.views.len();
@@ -899,12 +906,15 @@ impl Emitter<'_> {
         None
     }
     fn with_list_body(&mut self, e: &Expr, env: &Env) -> LangResult<Option<(Expr, Env)>> {
+        self.with_list_body_as(e, env, None)
+    }
+    fn with_list_body_as(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<Option<(Expr, Env)>> {
         if let Some(v) = self.resolve(e, env) {
             return Ok(Some(v));
         }
         match e {
             Expr::Call(n, _) if n == "list" => {
-                let ty = check::infer(e, &Self::types(env), self.p)?;
+                let ty = check::infer_context(e, &Self::types(env), self.p, want)?;
                 let v = self.list(e, env, Some(&ty))?;
                 Ok(Some((Expr::Var("ink_local_list".into()),
                     BTreeMap::from([("ink_local_list".into(), (v, ty))]))))
@@ -985,6 +995,7 @@ impl Emitter<'_> {
         r
     }
     fn length_inner(&mut self, e: &Expr, env: &Env) -> LangResult<String> {
+        if matches!(e,Expr::Call(n,a) if n=="list" && a.is_empty()) {return Ok("0u".into());}
         if let Expr::Call(n, a) = e {
             if n == "parallel_map" {
                 self.scalar(&a[1], env, &Type::U32)?;
@@ -1079,7 +1090,7 @@ impl Emitter<'_> {
         let Type::List(et) = check::infer_context(e, &Self::types(env), self.p, list.as_ref())? else {
             return Err("GPU list type".into());
         };
-        if let Some((e, env)) = self.with_list_body(e, env)? {
+        if let Some((e, env)) = self.with_list_body_as(e, env, Some(&Type::List(et.clone())))? {
             return self.element_as(&e, index, &env, Some(&et));
         }
         match e {
@@ -1185,44 +1196,46 @@ impl Emitter<'_> {
         }
     }
     fn bound_slots(&mut self, e: &Expr, env: &Env) -> LangResult<Vec<usize>> {
+        let bounds=self.capacity_bounds(e,env)?;
+        if bounds.fixed!=0 || bounds.slots.is_empty() {
+            return Err("fixed local output uses the literal graph capacity".into());
+        }
+        Ok(bounds.slots)
+    }
+    fn capacity_bounds(&mut self, e: &Expr, env: &Env) -> LangResult<CapacityBound> {
         if self.depth >= 48 || self.budget == 0 {
             return Err("GPU collection lowering depth budget".into());
         }
-        self.budget -= 1;
-        self.depth += 1;
-        let r = self.bound_slots_inner(e, env);
-        self.depth -= 1;
-        r
+        self.budget -= 1;self.depth += 1;
+        let r = self.capacity_bounds_inner(e, env);
+        self.depth -= 1;r
     }
-    fn bound_slots_inner(&mut self, e: &Expr, env: &Env) -> LangResult<Vec<usize>> {
+    fn capacity_bounds_inner(&mut self, e: &Expr, env: &Env) -> LangResult<CapacityBound> {
         if let Expr::Call(n, a) = e {
-            if n == "parallel_map" {
-                return self.bound_slots(&a[0], env);
-            }
+            if n=="list" {return Ok(CapacityBound{fixed:a.len(),slots:vec![]});}
+            if n=="parallel_map" {return self.capacity_bounds(&a[0],env);}
         }
         if let Some((e, env)) = self.with_list_body(e, env)? {
-            return self.bound_slots(&e, &env);
+            return self.capacity_bounds(&e, &env);
         }
         match e {
             Expr::Call(n, a) if n == "choose" => {
-                let mut v = self.bound_slots(&a[1], env)?;
-                v.extend(self.bound_slots(&a[2], env)?);
-                Ok(v)
+                let left=self.capacity_bounds(&a[1],env)?;
+                Ok(left.union(self.capacity_bounds(&a[2],env)?))
             }
-            Expr::Var(n) => Ok(vec![env
-                .get(n)
-                .ok_or("list binding")?
-                .0
-                .parse()
-                .map_err(|_| "input slot")?]),
-            Expr::Method(xs, n, a) => {
-                let mut v = self.bound_slots(xs, env)?;
-                if n == "zip" {
-                    v.extend(self.bound_slots(&a[0], env)?)
+            Expr::Var(n) => {
+                let slot=&env.get(n).ok_or("list binding")?.0;
+                if let Some((_,length))=self.local_lists.get(slot) {
+                    Ok(CapacityBound{fixed:*length,slots:vec![]})
+                } else {
+                    Ok(CapacityBound{fixed:0,slots:vec![slot.parse().map_err(|_|"input slot")?]})
                 }
-                Ok(v)
             }
-            _ => Err("GPU output capacity is not input-bounded".into()),
+            Expr::Method(xs, n, a) => {
+                let bounds=self.capacity_bounds(xs,env)?;
+                if n=="zip" {Ok(bounds.union(self.capacity_bounds(&a[0],env)?))} else {Ok(bounds)}
+            }
+            _ => Err("GPU output capacity is not statically or input bounded".into()),
         }
     }
 }
@@ -1312,23 +1325,8 @@ fn store(t: &Type, value: &str, base: &str, off: &mut usize, p: &Program) -> Lan
         _ => return Err("unsupported GPU output".into()),
     })
 }
-fn types(p: &Program, needed: &std::collections::BTreeSet<String>) -> LangResult<String> {
-    let mut out = include_str!("u64.wgsl").to_owned();
-    out.push_str(include_str!("f32.wgsl"));
-    for t in ["u32", "InkU64", "i32", "bool"] {
-        out.push_str(&format!(
-            "struct InkBuffer_{t}{{data:array<{t},64>,length:u32,}}\n"
-        ));
-    }
-    for (n, fields) in &p.records {
-        if !needed.contains(n) { continue; }
-        out.push_str(&format!("struct R_{n}{{"));
-        for (n, t) in fields {
-            out.push_str(&format!("ink_f_{n}:{},", wg(t)?));
-        }
-        out.push_str("}\n");
-    }
-    Ok(out)
+fn types(p: &Program, dependencies: &ink_core::analysis::FunctionDependencies) -> LangResult<String> {
+    private_values::declarations(p, dependencies)
 }
 
 fn shader(f: &Function, p: &Program, declarations: &str) -> LangResult<(String, Vec<usize>)> {
@@ -1371,14 +1369,14 @@ fn shader(f: &Function, p: &Program, declarations: &str) -> LangResult<(String, 
         depth: 0,
         views: vec![],
         local_lists: BTreeMap::new(),
-        local_list_words: 0,
+        private: Default::default(),
         buffers: BTreeMap::new(),
     };
     let lengths = em.bound_slots(&f.body, &env)?;
     em.lines.clear();
     em.views.clear();
     em.local_lists.clear();
-    em.local_list_words = 0;
+    em.private = Default::default();
     em.buffers.clear();
     let length = em.length(&f.body, &env)?;
     em.line(format!(
@@ -1398,33 +1396,35 @@ fn shader(f: &Function, p: &Program, declarations: &str) -> LangResult<(String, 
 }
 /// Per-element collection work in a direct shader: 0 none, 1 filter/scan
 /// (linear per invocation), 2 sort (quadratic stable rank per invocation).
-fn heavy(e: &Expr, p: &Program, seen: &mut std::collections::BTreeSet<String>) -> u8 {
-    let all = |es: &mut dyn Iterator<Item = &Expr>, seen: &mut std::collections::BTreeSet<String>| {
-        es.map(|e| heavy(e, p, seen)).max().unwrap_or(0)
-    };
-    match e {
-        Expr::Method(x, n, a) => {
-            let own = match n.as_str() {
-                "sort" => 2,
-                "filter" | "scan" => 1,
-                _ => 0,
-            };
-            own.max(heavy(x, p, seen)).max(all(&mut a.iter(), seen))
-        }
-        Expr::Call(n, a) => {
-            let callee = p
-                .functions
-                .iter()
-                .find(|f| &f.name == n)
-                .filter(|_| seen.insert(n.clone()))
-                .map_or(0, |f| heavy(&f.body, p, seen));
-            callee.max(all(&mut a.iter(), seen))
-        }
-        Expr::Let(_, _, a, b) | Expr::Binary(_, a, b) => heavy(a, p, seen).max(heavy(b, p, seen)),
-        Expr::Lambda(_, b) | Expr::Neg(b) | Expr::Field(b, _) => heavy(b, p, seen),
-        Expr::Record(_, fs) => all(&mut fs.iter().map(|(_, e)| e), seen),
-        _ => 0,
+fn heavy(e: &Expr, p: &Program, env: &check::Env, want: &Type) -> u8 {
+    if ink_core::analysis::node_count(e,100000).is_none() {return 2;}
+    // Reuse the core's typed lexical walk, including shadowed callback scopes.
+    // This temporary analysis view is never admitted or emitted as source.
+    let root=Function{name:String::new(),params:env.iter().map(|(n,t)|(n.clone(),t.clone())).collect(),result:want.clone(),body:e.clone()};
+    let mut pending=vec![&root];let mut seen=std::collections::BTreeSet::new();
+    let mut level=0u8;let mut remaining=100000usize;
+    while let Some(f)=pending.pop() {
+        let Some(nodes)=ink_core::analysis::node_count(&f.body,remaining) else{return 2;};
+        remaining-=nodes;
+        let result=ink_core::analysis::typed_walk_context(p,f,|expression,scope,_|match expression {
+            Expr::Method(receiver,name,_) if ["filter","scan","sort"].contains(&name.as_str()) => {
+                // No public Buffer transport exists here. Every private owner
+                // has a checked <=64 bound, including its record descendants.
+                if !matches!(check::infer(receiver,scope,p),Ok(Type::Buffer(_))) {
+                    level=level.max(if name=="sort"{2}else{1});
+                }
+            }
+            Expr::Call(name,_) => {
+                if let Some(callee)=p.functions.iter().find(|f|&f.name==name) {
+                    if seen.insert(name.clone()) {pending.push(callee);}
+                }
+            }
+            Expr::Lambda(..) => level=2, // Unknown callback scope: conservative.
+            _=>{}
+        });
+        if result.is_err() {return 2;}
     }
+    level
 }
 /// Element bound for a direct shader whose invocations each repeat
 /// collection work: linear work per element up to 1,024 elements, quadratic
@@ -1457,7 +1457,7 @@ fn lower_filtered(checked: &core::CheckedModule, entry: Option<&str>) -> LangRes
             Err("contract precondition ingress uses the CPU host".to_owned())
         } else {
             ink_core::analysis::function_dependencies(p, &f.name, 100000)
-                .and_then(|dependencies| types(p, &dependencies.named_types))
+                .and_then(|dependencies| types(p, &dependencies))
         };
         let compiled = declarations.as_ref().map_err(Clone::clone)
             .and_then(|declarations| shader(f, p, declarations));
@@ -1477,7 +1477,7 @@ fn lower_filtered(checked: &core::CheckedModule, entry: Option<&str>) -> LangRes
             }
             Err(e) => (None, Some(e)),
         };
-        let level = heavy(&f.body, p, &mut std::collections::BTreeSet::new());
+        let level = heavy(&f.body, p, &check::params_env(&f.params)?, &f.result);
         let required = graph.is_some() && (shader.is_none() || level > 0);
         let reason = if shader.is_some() || graph.is_some() {
             None

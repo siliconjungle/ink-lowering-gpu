@@ -87,3 +87,7 @@ engine.close();console.log('PASS prepared graph/legacy residency, input capture,
 
 for(const value of [0,1,16,0xffffffff]) assert.deepEqual(graphCapacity({nodes:[{args:[],capacity:{kind:'fixed',value,args:[]}}],output:{node:0}},[]),{capacities:[value],outputCount:value});
 for(const value of [-1,0x100000000,NaN,Infinity,0.5,undefined]) assert.throws(()=>graphCapacity({nodes:[{args:[],capacity:{kind:'fixed',value,args:[]}}],output:{node:0}},[]),/capacity/);
+
+for(const input of [0,2,4,9]) assert.deepEqual(graphCapacity({nodes:[{args:[{param:0}],capacity:{kind:'max',floor:4,args:[0]}}],output:{node:0}},[input]),{capacities:[Math.max(4,input)],outputCount:Math.max(4,input)});
+for(const floor of [-1,0x100000000,NaN,Infinity,0.5,null]) assert.throws(()=>graphCapacity({nodes:[{args:[{param:0}],capacity:{kind:'max',floor,args:[0]}}],output:{node:0}},[9]),/capacity/);
+assert.throws(()=>graphCapacity({nodes:[{args:[],capacity:{kind:'max',floor:4,args:[]}}],output:{node:0}},[]),/capacity/);

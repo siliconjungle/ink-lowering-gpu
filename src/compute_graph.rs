@@ -233,7 +233,7 @@ impl Graph<'_> {
             }
         }
         if matches!(ty, Type::List(_)) {
-            if heavy(e, self.p, &mut std::collections::BTreeSet::new()) > 0 {
+            if heavy(e, self.p, &Self::types(env), &ty) > 0 {
                 return Err("literal graph collection control retains bounded direct-shader work; CPU fallback".into());
             }
             // Keep lazy list control inside one literal shader. Eagerly staging
@@ -462,7 +462,7 @@ impl Graph<'_> {
             depth: 0,
             views: vec![],
             local_lists: BTreeMap::new(),
-            local_list_words: 0,
+            private: Default::default(),
             buffers: BTreeMap::new(),
         };
         let et = leaf(ty);
@@ -480,6 +480,7 @@ impl Graph<'_> {
         let mut prefix = String::new();
         let mut literal_length = None;
         let mut literal_bounds = Vec::new();
+        let mut literal_floor = 0;
         if op == "take" || op == "drop" {
             let count = em.scalar(initial.ok_or("slice count missing")?, &local, &Type::U32)?;
             em.line(format!("let clipped=min({}, {count});", len.as_ref().unwrap()));
@@ -488,13 +489,14 @@ impl Graph<'_> {
         match op {
             "literal" => {
                 let expression = expression.ok_or("literal expression missing")?;
-                literal_bounds = em.bound_slots(expression, &local)?;
+                let bounds=em.capacity_bounds(expression,&local)?;
+                literal_bounds=bounds.slots;literal_floor=bounds.fixed;
                 literal_bounds.sort_unstable();
                 literal_bounds.dedup();
                 em.lines.clear();
                 em.views.clear();
                 em.local_lists.clear();
-                em.local_list_words = 0;
+                em.private = Default::default();
                 em.buffers.clear();
                 literal_length = Some(em.length(expression, &local)?);
                 prefix = std::mem::take(&mut em.lines);
@@ -664,8 +666,8 @@ impl Graph<'_> {
             "filter"=>format!("if(gid.x!=0u){{return;}}var used=0u;for(var i=0u;i<{};i++){{\n{}\n}}output[0]=used;",len.unwrap(),em.lines),
             "concat"=>{let second=load_list(et,&format!("a{}",slots[1]),"i",self.p)?;format!("if(gid.x!=0u){{return;}}let n={};output[0]=n+a{}[0];for(var i=0u;i<n;i++){{{}}}for(var i=0u;i<a{}[0];i++){{{}}}",len.unwrap(),slots[1],em.lines,slots[1],store(et,&second,&format!("1u+(n+i)*{}u",lanes(et,self.p,true)?),&mut 0,self.p)?)},
             "sum"|"scan"=>format!("if(gid.x!=0u){{return;}}var acc:{}={};{}for(var i=0u;i<{};i++){{\n{}\n}}{}",wg(et)?,if *et==Type::F32{"0u"}else if *et==Type::U64{"InkU64(0u,0u)"}else if *et==Type::I32{"0i"}else{"0u"},if op=="scan"{format!("output[0]={};",len.as_ref().unwrap())}else{String::new()},len.unwrap(),em.lines,if op=="sum"{store(ty,"acc","0u",&mut 0,self.p)?}else{String::new()}),
-            "foldl"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,views:vec![],local_lists:BTreeMap::new(),local_list_words:0,buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};for(var i=0u;i<{};i++){{\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
-            "foldr"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,views:vec![],local_lists:BTreeMap::new(),local_list_words:0,buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};var cursor={};loop{{if(cursor==0u){{break;}}cursor--;let i=cursor;\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
+            "foldl"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,views:vec![],local_lists:BTreeMap::new(),private:Default::default(),buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};for(var i=0u;i<{};i++){{\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
+            "foldr"=>{let mut start=Emitter{p:self.p,lines:String::new(),next:10000,budget:100000,depth:0,views:vec![],local_lists:BTreeMap::new(),private:Default::default(),buffers:BTreeMap::new()};let init=start.scalar(initial.ok_or("fold initial missing")?,&bindings,ty)?;format!("if(gid.x!=0u){{return;}}{}var acc:{}={init};var cursor={};loop{{if(cursor==0u){{break;}}cursor--;let i=cursor;\n{}\n}}{}",start.lines,wg(ty)?,len.unwrap(),em.lines,store(ty,"acc","0u",&mut 0,self.p)?)},
             "count"=>format!("if(gid.x!=0u){{return;}}output[0]={};output[1]=0u;",len.unwrap()),
             _=>format!("if(gid.x!=0u){{return;}}{}",em.lines)
         }
@@ -678,7 +680,9 @@ impl Graph<'_> {
             let Expr::Call(_, items) = expression.unwrap() else { unreachable!() };
             json!({"kind":"fixed","value":items.len(),"args":[]})
         } else if op == "literal" {
-            json!({"kind":"max","args":literal_bounds})
+            if literal_bounds.is_empty() {json!({"kind":"fixed","value":literal_floor,"args":[]})}
+            else if literal_floor==0 {json!({"kind":"max","args":literal_bounds})}
+            else {json!({"kind":"max","floor":literal_floor,"args":literal_bounds})}
         } else if scalar {
             json!({"kind":"one","args":[]})
         } else {
@@ -722,14 +726,14 @@ pub(super) fn lower(
     };
     let out = match g.walk(&f.body, &env, Some(&f.result)) {
         Ok(out) => out,
-        Err(reason) if scalar_result(&f.result) && heavy(&f.body,p,&mut std::collections::BTreeSet::new())==0 => {
+        Err(reason) if heavy(&f.body,p,&check::params_env(&f.params)?,&f.result)==0 => {
             // Internal owners need not become graph/host intermediates. When a
-            // staged decomposition is unavailable, run the complete scalar body
-            // through the same bounded literal emitter. Keep lazy control inside
+            // staged decomposition is unavailable, run the complete body through
+            // the same bounded literal emitter and explicit output capacity. Keep lazy control inside
             // that shader and preserve direct filter/scan/sort work restrictions.
             g.nodes.clear();g.shaders.clear();
-            g.node("scalar",&f.result,&env,vec![],Some(&f.body),None,None)
-                .map_err(|fallback|format!("{reason}; literal scalar: {fallback}"))?
+            g.node(if scalar_result(&f.result){"scalar"}else{"literal"},&f.result,&env,vec![],Some(&f.body),None,None)
+                .map_err(|fallback|format!("{reason}; literal body: {fallback}"))?
         }
         Err(reason) => return Err(reason),
     };
