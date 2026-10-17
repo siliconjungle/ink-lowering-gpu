@@ -6,7 +6,7 @@ export function graphCapacity(graph, argumentCounts) {
   for(const n of graph.nodes) {
     const a=n.args.map(count), c=n.capacity;
     const values=c.args.map(i=>a[i]);
-    const size=c.kind==='fixed'?c.value:c.kind==='one'?1:c.kind==='same'?values[0]:c.kind==='min'?Math.min(...values):c.kind==='sum'?values.reduce((x,y)=>x+y,0):NaN;
+    const size=c.kind==='fixed'?c.value:c.kind==='one'?1:c.kind==='same'?values[0]:c.kind==='min'?Math.min(...values):c.kind==='max'?Math.max(...values):c.kind==='sum'?values.reduce((x,y)=>x+y,0):NaN;
     if(!Number.isSafeInteger(size)||size<0||size>0xffffffff)throw Error('GPU graph capacity outside u32 bounds');
     capacities.push(size);
   }

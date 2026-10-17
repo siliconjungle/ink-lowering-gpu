@@ -84,6 +84,35 @@ fn lanes(t: &Type, p: &Program, _gpu: bool) -> LangResult<usize> {
     ink_abi::flat_width(&ink_abi::describe(t, &p.records, &p.enums, &p.ids)?)
 }
 
+// Function-private arrays use WGSL alignment, not the packed transport ABI.
+// Count vec3/record tail padding in the local allocation admission bound.
+fn local_layout(t: &Type, p: &Program, depth: usize, budget: &mut usize) -> LangResult<(usize, usize)> {
+    if depth >= 48 || *budget == 0 {
+        return Err("GPU local list layout budget exceeded; CPU fallback".into());
+    }
+    *budget -= 1;
+    match t {
+        Type::U32 | Type::I32 | Type::F32 | Type::Bool => Ok((1, 1)),
+        Type::U64 => Ok((1, 2)),
+        Type::Vector(inner, n) if matches!(inner.as_ref(), Type::U32 | Type::I32 | Type::F32 | Type::Bool) =>
+            Ok((if *n == 2 { 2 } else { 4 }, *n as usize)),
+        Type::Named(name) => {
+            let mut alignment = 1;
+            let mut size = 0usize;
+            for (_, t) in p.records.get(name).ok_or("GPU local list record layout")? {
+                let (a, s) = local_layout(t, p, depth + 1, budget)?;
+                size = size.checked_add(a - 1).map(|n| n / a * a)
+                    .and_then(|n| n.checked_add(s)).ok_or("GPU local list layout overflow")?;
+                alignment = alignment.max(a);
+            }
+            let size = size.checked_add(alignment - 1).map(|n| n / alignment * alignment)
+                .ok_or("GPU local list layout overflow")?;
+            Ok((alignment, size))
+        }
+        _ => Err("GPU local list element layout is unsupported; CPU fallback".into()),
+    }
+}
+
 // Upper length bounds follow owners through literal emission. Complementary
 // partitions retain their common origin, so rejoining even dynamically split
 // halves stays bounded by the original length. This is emission eligibility,
@@ -124,6 +153,8 @@ struct Emitter<'a> {
     budget: usize,
     depth: usize,
     views: Vec<(Expr, Env)>,
+    local_lists: BTreeMap<String, (String, usize)>,
+    local_list_words: usize,
     buffers: BTreeMap<String, BufferBound>,
 }
 impl Emitter<'_> {
@@ -783,7 +814,54 @@ impl Emitter<'_> {
             _ => Err("unsupported scalar compute expression".into()),
         }
     }
-    fn list(&mut self, e: &Expr, env: &Env, _want: Option<&Type>) -> LangResult<String> {
+    fn list(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<String> {
+        if self.depth >= 48 {
+            return Err("GPU local collection lowering depth budget".into());
+        }
+        self.depth += 1;
+        let result = self.list_inner(e, env, want);
+        self.depth -= 1;
+        result
+    }
+    fn list_inner(&mut self, e: &Expr, env: &Env, want: Option<&Type>) -> LangResult<String> {
+        if self.budget == 0 {
+            return Err("GPU local collection emission budget".into());
+        }
+        self.budget -= 1;
+        if let Expr::Var(n) = e {
+            return env.get(n).map(|(v, _)| v.clone()).ok_or("GPU list binding".into());
+        }
+        if let Expr::Call(n, items) = e {
+            if n == "list" {
+                let Type::List(et) = check::infer_context(e, &Self::types(env), self.p, want)? else {
+                    return Err("GPU local list type".into());
+                };
+                lanes(&et, self.p, true)?;
+                let (alignment, size) = local_layout(&et, self.p, 0, &mut self.budget)?;
+                let stride = size.checked_add(alignment - 1).map(|n| n / alignment * alignment)
+                    .ok_or("GPU local list size overflow")?;
+                let words = stride.checked_mul(items.len().max(1))
+                    .ok_or("GPU local list size overflow")?;
+                if words > 4096usize.saturating_sub(self.local_list_words) {
+                    return Err("GPU local list storage budget exceeded; CPU fallback".into());
+                }
+                self.local_list_words += words;
+                let array = self.fresh();
+                self.line(format!("var {array}:array<{},{}>;", wg(&et)?, items.len().max(1)));
+                // A source constructor is strict and evaluates its elements once,
+                // in order, before a subsequent use of the immutable list.
+                for (i, item) in items.iter().enumerate() {
+                    let value = self.scalar(item, env, &et)?;
+                    self.line(format!("{array}[{i}u]={value};"));
+                }
+                let slot = format!("local_list_{array}");
+                self.local_lists.insert(slot.clone(), (array, items.len()));
+                return Ok(slot);
+            }
+        }
+        if let Some((body, local)) = self.with_list_body(e, env)? {
+            return self.list(&body, &local, want);
+        }
         let i = self.views.len();
         self.views.push((e.clone(), env.clone()));
         Ok(format!("view{i}"))
@@ -821,6 +899,12 @@ impl Emitter<'_> {
             return Ok(Some(v));
         }
         match e {
+            Expr::Call(n, _) if n == "list" => {
+                let ty = check::infer(e, &Self::types(env), self.p)?;
+                let v = self.list(e, env, Some(&ty))?;
+                Ok(Some((Expr::Var("ink_local_list".into()),
+                    BTreeMap::from([("ink_local_list".into(), (v, ty))]))))
+            }
             Expr::Let(n, annotation, x, b) => {
                 let t = check::infer_context(x, &Self::types(env), self.p, annotation.as_deref())?;
                 let v = if matches!(t, Type::List(_)) {
@@ -909,6 +993,9 @@ impl Emitter<'_> {
         match e {
             Expr::Var(n) => {
                 let (slot, _) = env.get(n).ok_or("list binding")?;
+                if let Some((_, length)) = self.local_lists.get(slot) {
+                    return Ok(format!("{length}u"));
+                }
                 Ok(format!("a{slot}[0u]"))
             }
             Expr::Call(n, a) if n == "choose" => {
@@ -994,6 +1081,9 @@ impl Emitter<'_> {
         match e {
             Expr::Var(n) => {
                 let (slot, _) = env.get(n).ok_or("list binding")?;
+                if let Some((array, _)) = self.local_lists.get(slot) {
+                    return Ok(format!("{array}[{index}]"));
+                }
                 load_list(&et, &format!("a{slot}"), index, self.p)
             }
             Expr::Call(n, a) if n == "choose" => {
@@ -1091,9 +1181,10 @@ impl Emitter<'_> {
         }
     }
     fn bound_slots(&mut self, e: &Expr, env: &Env) -> LangResult<Vec<usize>> {
-        if self.depth >= 48 {
+        if self.depth >= 48 || self.budget == 0 {
             return Err("GPU collection lowering depth budget".into());
         }
+        self.budget -= 1;
         self.depth += 1;
         let r = self.bound_slots_inner(e, env);
         self.depth -= 1;
@@ -1274,10 +1365,16 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
         budget: 100000,
         depth: 0,
         views: vec![],
+        local_lists: BTreeMap::new(),
+        local_list_words: 0,
         buffers: BTreeMap::new(),
     };
     let lengths = em.bound_slots(&f.body, &env)?;
     em.lines.clear();
+    em.views.clear();
+    em.local_lists.clear();
+    em.local_list_words = 0;
+    em.buffers.clear();
     let length = em.length(&f.body, &env)?;
     em.line(format!(
         "if(i==0u){{output[0u]={length};}}if(i>={length}){{return;}}"

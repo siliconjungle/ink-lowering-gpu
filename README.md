@@ -53,3 +53,14 @@ constructed structurally so reads in an index expression retain their own offset
 These are literal operations, not hash recognition, fusion or reassociation.
 The literal-graph fixture includes empty, oversized and nested slices; its oracle
 frames can be exported with `INK_GPU_GRAPH_EXPORT` for actual-device validation.
+
+Function-local immutable list constructors can materialize into private WGSL
+arrays and cross scalar helpers, loops and captures without repeated constructor
+evaluation. Their cumulative per-shader allocation bound is 4096 words, including
+WGSL vector/record padding. Unsupported layouts or exhausted bounds keep CPU
+execution. Supported lazy list choices have one literal graph stage with a maximum
+input-derived capacity and a separately selected logical length. Filtering, scans
+and sorting inside such control retain the existing bounded direct-shader path;
+graph wrapping cannot remove its work limits. These mechanisms enable the authored
+244-parameter source-gradient/Adam resident training consumer in Ink, without
+recognizing networks, optimizers or differentiation-generated helper names.

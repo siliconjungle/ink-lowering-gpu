@@ -1288,6 +1288,7 @@ pub(super) fn graph_capacity(graph: &Value, arguments: &[usize]) -> Result<(Vec<
             Some("one") => 1,
             Some("same") => *values.first().ok_or("missing same capacity")?,
             Some("min") => *values.iter().min().ok_or("missing min capacity")?,
+            Some("max") => *values.iter().max().ok_or("missing max capacity")?,
             Some("sum") => values.iter().try_fold(0usize, |a, b| {
                 a.checked_add(*b).ok_or("graph capacity overflow")
             })?,
