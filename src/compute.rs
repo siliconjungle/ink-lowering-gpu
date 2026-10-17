@@ -1308,7 +1308,7 @@ fn store(t: &Type, value: &str, base: &str, off: &mut usize, p: &Program) -> Lan
         _ => return Err("unsupported GPU output".into()),
     })
 }
-fn types(p: &Program, _gpu: bool) -> LangResult<String> {
+fn types(p: &Program, needed: &std::collections::BTreeSet<String>) -> LangResult<String> {
     let mut out = include_str!("u64.wgsl").to_owned();
     out.push_str(include_str!("f32.wgsl"));
     for t in ["u32", "InkU64", "i32", "bool"] {
@@ -1317,6 +1317,7 @@ fn types(p: &Program, _gpu: bool) -> LangResult<String> {
         ));
     }
     for (n, fields) in &p.records {
+        if !needed.contains(n) { continue; }
         out.push_str(&format!("struct R_{n}{{"));
         for (n, t) in fields {
             out.push_str(&format!("ink_f_{n}:{},", wg(t)?));
@@ -1326,7 +1327,7 @@ fn types(p: &Program, _gpu: bool) -> LangResult<String> {
     Ok(out)
 }
 
-fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
+fn shader(f: &Function, p: &Program, declarations: &str) -> LangResult<(String, Vec<usize>)> {
     let Type::List(et) = &f.result else {
         return Err(
             "GPU v2 currently requires an array result; ordered scalar reductions use CPU".into(),
@@ -1337,7 +1338,7 @@ fn shader(f: &Function, p: &Program) -> LangResult<(String, Vec<usize>)> {
     }
     lanes(et, p, true)?;
     let mut env = Env::new();
-    let mut decl = types(p, true)?;
+    let mut decl = declarations.to_owned();
     for (i, (n, t)) in f.params.iter().enumerate() {
         let leaf = if let Type::List(t) = t { t.as_ref() } else { t };
         lanes(leaf, p, true)?;
@@ -1437,7 +1438,14 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
     let mut functions = Vec::new();
     for (i, f) in p.functions.iter().enumerate() {
         let guard=p.contracts.precondition_checks.get(&f.name);
-        let compiled = if guard.is_some(){Err("contract precondition ingress uses the CPU host".into())}else{shader(f, p)};
+        let declarations = if guard.is_some() {
+            Err("contract precondition ingress uses the CPU host".to_owned())
+        } else {
+            ink_core::analysis::function_dependencies(p, &f.name, 100000)
+                .and_then(|dependencies| types(p, &dependencies.named_types))
+        };
+        let compiled = declarations.as_ref().map_err(Clone::clone)
+            .and_then(|declarations| shader(f, p, declarations));
         let (shader, lengths, direct_reason) = match compiled {
             Ok((s, l)) => {
                 let path = format!("compute-{i}.wgsl");
@@ -1446,7 +1454,8 @@ pub fn lower(checked: &core::CheckedModule) -> LangResult<crate::gpu::Emission> 
             }
             Err(e) => (None, vec![], Some(e)),
         };
-        let (graph, graph_reason) = match if guard.is_some(){Err("contract precondition ingress uses the CPU host".into())}else{graph::lower(f, p, i)} {
+        let (graph, graph_reason) = match declarations.as_ref().map_err(Clone::clone)
+            .and_then(|declarations| graph::lower(f, p, i, declarations)) {
             Ok((descriptor, shaders)) => {
                 files.extend(shaders);
                 (Some(descriptor), None)

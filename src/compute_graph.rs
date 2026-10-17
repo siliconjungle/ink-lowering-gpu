@@ -9,6 +9,7 @@ struct Ref {
 type GraphEnv = BTreeMap<String, Ref>;
 struct Graph<'a> {
     p: &'a Program,
+    declarations: &'a str,
     index: usize,
     nodes: Vec<Value>,
     shaders: BTreeMap<String, String>,
@@ -413,7 +414,7 @@ impl Graph<'_> {
         }
         let mut refs: Vec<Ref> = Vec::new();
         let mut bindings = Env::new();
-        let mut decl = types(self.p, true)?;
+        let mut decl = self.declarations.to_owned();
         let mut needed = std::collections::BTreeSet::new();
         for e in [expression, initial, callback].into_iter().flatten() {
             free_vars(e, &mut std::collections::BTreeSet::new(), &mut needed);
@@ -694,6 +695,7 @@ pub(super) fn lower(
     f: &Function,
     p: &Program,
     index: usize,
+    declarations: &str,
 ) -> LangResult<(Value, BTreeMap<String, String>)> {
     let mut env = GraphEnv::new();
     for (i, (n, t)) in f.params.iter().enumerate() {
@@ -710,6 +712,7 @@ pub(super) fn lower(
     }
     let mut g = Graph {
         p,
+        declarations,
         index,
         nodes: Vec::new(),
         shaders: BTreeMap::new(),
