@@ -49,6 +49,16 @@ Graph headers retain actual-length checks; direct steps retain fixed capacities.
 Existing whole-value reads and staging-buffer reuse remain unchanged. This is a
 literal transport mechanism, with no shader or arithmetic rewrite.
 
+Packed browser adapters provide `copyFrom(target, plan, input, source,
+sourcePlan, stepIndex)` for resident List composition. Identical descriptors
+and conservative source/destination capacities are required. The actual List
+header and bounded payload copy on the same GPU queue with no host readback;
+later source mutation or close cannot change that snapshot. Feedback destinations
+follow the same carried-value/owed-publication rules as ordinary writes. Vector
+and record strides use the shared packed layout. This supplies no algebraic
+fusion or profitable placement policy. Browser runtime owns opaque session
+identity, serialization and CPU/cross-backend transport.
+
 ## License
 
 Project code and documentation are [MIT licensed](LICENSE). Third-party dependencies,

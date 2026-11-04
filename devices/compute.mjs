@@ -507,14 +507,15 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
   }
   // Replace a named input for the next iteration. A fed-back input's carried
   // value is its step's last output, which this replaces.
-  async function write(r, p, input, d) {
+  async function write(r, p, input, d, capacity=false) {
     live(r);
     const reference=p.inputs.get(input);if(!reference)fail('unknown pipeline input');
     const list=reference.type.kind==='list';
     return scoped(()=>{
       let words;
       if(r.mode==='steps') {
-        if(d.count!==reference.count)fail('steps sessions keep input shapes; reopen to change a length');
+        if(capacity){if(d.count>reference.count)fail('written input exceeds the session capacity');}
+        else if(d.count!==reference.count)fail('steps sessions keep input shapes; reopen to change a length');
         const step=p.feedback.get(input);
         let target;
         if(step!==undefined&&r.iteration>0){words=headed(d,true);target=r.banks[(r.iteration-1)%2][step];}
@@ -532,6 +533,32 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
         else{device.queue.writeBuffer(target.buffer,0,words);for(const f of r.pending)if(f.input===input)f.skip=true;}
       }
       return {counters:{upload_bytes:words.byteLength}};
+    });
+  }
+  // Snapshot a completed logical List value into another resident session's
+  // input. The header and bounded payload stay on the device. Queue ordering
+  // makes later source writes/steps/close independent of the copied value.
+  async function copyFrom(r,p,input,source,sourcePlan,index){
+    live(r);live(source);
+    if(!source.iteration)fail('source session has not run an iteration');
+    const reference=p.inputs.get(input);if(!reference)fail('unknown pipeline input');
+    const value=location(source,sourcePlan,index);
+    if(reference.type.kind!=='list'||value.type.kind!=='list'||JSON.stringify(reference.type)!==JSON.stringify(value.type))fail('resident List type mismatch');
+    if(value.capacity>reference.count)fail('resident value exceeds input capacity');
+    return scoped(()=>{
+      let target;
+      if(r.mode==='steps'){
+        const step=p.feedback.get(input);
+        target=step!==undefined&&r.iteration>0?r.banks[(r.iteration-1)%2][step]:r.input[reference.index];
+      }else{
+        const step=p.feedback.get(input),carried=step!==undefined&&r.iteration>0?r.values[step]:null;
+        if(carried&&!r.constants.some(c=>c.buffer===carried.buffer))target=carried.buffer;
+        else{target=r.constants[reference.index].buffer;for(const f of r.pending)if(f.input===input)f.skip=true;}
+      }
+      const bytes=(1+value.capacity*width(value.type))*4;
+      if(value.buffer===target)return {counters:{upload_bytes:0,readback_bytes:0,resident_copy_bytes:0}};
+      const commands=device.createCommandEncoder();commands.copyBufferToBuffer(value.buffer,0,target,0,bytes);device.queue.submit([commands.finish()]);
+      return {counters:{upload_bytes:0,readback_bytes:0,resident_copy_bytes:bytes}};
     });
   }
   // The device buffer currently holding a step's value, for a renderer or
@@ -582,7 +609,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
     const ready=!!device&&!lost&&!gpuError;
     return {device:ready,shaders:[...new Set(names)].sort().map(name=>[name,ready&&pipelines.has(name)])};
   }
-  return {prepare,preparation,run,capture,open,advance,read,write,view,finish,close:closeAll,
+  return {prepare,preparation,run,capture,open,advance,read,write,copyFrom,view,finish,close:closeAll,
     closeSession:close,handle:()=>device,
   };
   function closeAll(){for(const r of [...residents])close(r);if(!supplied)device?.destroy();lost=true;gpuError="engine disposed";pipelines.clear();}

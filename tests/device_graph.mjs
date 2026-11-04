@@ -18,7 +18,8 @@ globalThis.fetch=async url=>({async text(){return String(url).split('/').at(-1)}
 const list={kind:'list',element:{kind:'u32'}},word={kind:'u32'};
 const graph=(op,result,args,kind,indices)=>({nodes:[{id:0,op,args:args.map(param=>({param})),result,capacity:{kind,args:indices},shader:op,ordered:op!=='map',workgroup_size:op==='map'?64:1}],output:{node:0}});
 const functions=[{graph_required:true,graph:graph('filter',list,[0,1],'same',[0]),result:list},{shader:'direct-map',graph_required:false,graph:graph('map',list,[0],'same',[0]),result:list},{graph_required:true,graph:graph('sum',word,[0],'one',[]),result:word}];
-const engine=createDevice({root:new URL('http://mock/'),enabled:true,onLost(){},fail(s){throw Error(s)},numericDestination(t,d){if(t.kind!=='list'||!(d instanceof Uint32Array)||t.element.kind!=='u32')throw Error('dtype');return new Uint32Array(d.buffer,d.byteOffset,d.byteLength/4);},width(t){return t.kind==='list'?this?.width?.(t.element)??1:1},unpack(w,t){return t.kind==='list'?[...w]:w[0]},MAX_BYTES:1024*1024});
+const packedWidth=t=>t.kind==='list'?packedWidth(t.element):t.kind==='vector'?t.size*packedWidth(t.element):t.kind==='record'?t.fields.reduce((n,f)=>n+packedWidth(f.type),0):1;
+const engine=createDevice({root:new URL('http://mock/'),enabled:true,onLost(){},fail(s){throw Error(s)},numericDestination(t,d){if(t.kind!=='list'||!(d instanceof Uint32Array)||t.element.kind!=='u32')throw Error('dtype');return new Uint32Array(d.buffer,d.byteOffset,d.byteLength/4);},width:packedWidth,unpack(w,t){return t.kind==='list'?[...w]:w[0]},MAX_BYTES:1024*1024});
 function plan(input,iterations=1){return {inputs:new Map([['xs',{index:0}]]),feedback:new Map(),constants:[{words:Uint32Array.from(input),type:list,count:input.length},{words:Uint32Array.of(2),type:word,count:1}],steps:[{f:functions[0],args:[{kind:'constant',index:0,count:input.length},{kind:'constant',index:1,count:1}],count:input.length},{f:functions[1],args:[{kind:'step',index:0,count:input.length}],count:input.length},{f:functions[2],args:[{kind:'step',index:1,count:input.length}],count:1}],outputs:['result'],ids:new Map([['result',2]]),iterations,reason:null};}
 const p=plan([1,3,2,4],3);
 assert.deepEqual(engine.preparation(p),{device:false,shaders:[['filter',false],['map',false],['sum',false]]});
@@ -104,5 +105,37 @@ await engine.advance(numericSession,numericPlan,1);assert.deepEqual(Array.from(d
 legacy.constants[0].words.set([0,4294967295]);const numericLegacy=await engine.open(legacy);await engine.advance(numericLegacy,legacy,1);const legacyDestination=new Uint32Array([99,99,99]);
 assert.equal((await engine.read(numericLegacy,legacy,{step:'result',into:legacyDestination})).count,2);assert.deepEqual(Array.from(legacyDestination),[1,0,99]);engine.closeSession(numericLegacy);assert.equal(live,0);
 console.log('PASS numeric destination readback, mapped lifetime, graph/legacy lengths, dtype/capacity and tails');
+
+// Cross-session resident copying keeps headers and snapshots on the device.
+function copyTarget(capacity){return {inputs:new Map([['xs',{index:0,type:list,count:capacity}]]),feedback:new Map(),constants:[{words:new Uint32Array(capacity),type:list,count:capacity}],steps:[{f:functions[1],args:[{kind:'constant',index:0,count:capacity}],count:capacity}],outputs:['result'],ids:new Map([['result',0]]),iterations:1,reason:null};}
+const producerPlan=plan([1,3,2,4]);producerPlan.ids.set('filtered',0);
+const consumerPlan=copyTarget(4),smallConsumerPlan=copyTarget(2);
+await engine.prepare(producerPlan);await engine.prepare(consumerPlan);await engine.prepare(smallConsumerPlan);
+const producer=await engine.open(producerPlan),consumer=await engine.open(consumerPlan),smallConsumer=await engine.open(smallConsumerPlan);
+await assert.rejects(engine.copyFrom(consumer,consumerPlan,'xs',producer,producerPlan,0),/iteration/);
+await engine.advance(producer,producerPlan,1);
+const transferred=await engine.copyFrom(consumer,consumerPlan,'xs',producer,producerPlan,0);
+assert.deepEqual(transferred.counters,{upload_bytes:0,readback_bytes:0,resident_copy_bytes:20});
+await assert.rejects(engine.copyFrom(smallConsumer,smallConsumerPlan,'xs',producer,producerPlan,0),/capacity/);
+await assert.rejects(engine.copyFrom(consumer,consumerPlan,'missing',producer,producerPlan,0),/input/);
+await assert.rejects(engine.copyFrom(consumer,consumerPlan,'xs',producer,producerPlan,2),/type/);
+engine.closeSession(producer);await engine.advance(consumer,consumerPlan,1);
+assert.deepEqual((await engine.read(consumer,consumerPlan,{outputs:['result']})).values.result,[4,5]);
+await engine.advance(smallConsumer,smallConsumerPlan,1);assert.deepEqual((await engine.read(smallConsumer,smallConsumerPlan,{outputs:['result']})).values.result,[1,1]);
+await assert.rejects(engine.copyFrom(consumer,consumerPlan,'xs',producer,producerPlan,0),/closed/);
+engine.closeSession(consumer);engine.closeSession(smallConsumer);assert.equal(live,0);
+const feedbackPlan=plan([9,10,11,12]);feedbackPlan.feedback.set('xs',1);feedbackPlan.inputs.set('xs',{index:0,type:list,count:4});
+const feedback=await engine.open(feedbackPlan),producer2=await engine.open(producerPlan);await engine.advance(producer2,producerPlan,1);await engine.advance(feedback,feedbackPlan,1);
+await engine.copyFrom(feedback,feedbackPlan,'xs',producer2,producerPlan,0);await engine.advance(feedback,feedbackPlan,1);
+assert.equal((await engine.read(feedback,feedbackPlan,{outputs:['result']})).values.result,9);
+engine.closeSession(producer2);engine.closeSession(feedback);assert.equal(live,0);
+console.log('PASS resident List composition, smaller logical extents, feedback, source-close snapshots and rejection boundaries');
+
+const vectorList={kind:'list',element:{kind:'vector',size:3,element:word}};
+const identityVector={graph_required:true,result:vectorList,graph:{nodes:[],output:{param:0}}};
+const vectorPlan=words=>({inputs:new Map([['xs',{index:0,type:vectorList,count:2}]]),feedback:new Map(),constants:[{words:Uint32Array.from(words),type:vectorList,count:2}],steps:[{f:identityVector,args:[{kind:'constant',index:0,count:2}],count:2}],outputs:['result'],ids:new Map([['result',0]]),iterations:1,reason:null});
+const vp=vectorPlan([1,2,3,4,5,6]),vq=vectorPlan([0,0,0,0,0,0]);await engine.prepare(vp);await engine.prepare(vq);const vs=await engine.open(vp),vt=await engine.open(vq);await engine.advance(vs,vp,1);
+assert.equal((await engine.copyFrom(vt,vq,'xs',vs,vp,0)).counters.resident_copy_bytes,28);await engine.advance(vt,vq,1);assert.deepEqual(Array.from(new Uint32Array(engine.view(vt,vq,0).buffer.data)),[2,1,2,3,4,5,6]);engine.closeSession(vs);engine.closeSession(vt);assert.equal(live,0);
+console.log('PASS resident vector stride and identity-input aliases');
 
 engine.close();
