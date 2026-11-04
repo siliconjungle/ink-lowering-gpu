@@ -41,6 +41,14 @@ results survive readback unmap, caller mutation, subsequent runs and close; this
 does not expose a borrowed device view or claim zero-copy public outputs. Run
 `node tests/device_graph.mjs` for poison-on-unmap and retained-output coverage.
 
+Packed browser adapters also accept a supplied ABI `numericDestination` codec.
+`read({step,into:typedArray})` validates the dtype and copies complete flat numeric
+List words directly from mapped readback into caller-owned storage before unmap.
+No borrowed view escapes and no intermediate owned word/Number array is needed.
+Graph headers retain actual-length checks; direct steps retain fixed capacities.
+Existing whole-value reads and staging-buffer reuse remain unchanged. This is a
+literal transport mechanism, with no shader or arithmetic rewrite.
+
 ## License
 
 Project code and documentation are [MIT licensed](LICENSE). Third-party dependencies,

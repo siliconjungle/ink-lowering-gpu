@@ -167,7 +167,7 @@ if(wid.x==0u){if(mode==1u){out[0]=n;}else{out[0]=data[0];}}
 // One device for every pipeline, session and caller-supplied renderer. A
 // session uploads its inputs once, keeps every value resident across calls,
 // and reads back only what is asked for.
-export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BYTES, device: supplied=null}) {
+export function createDevice({root, enabled, onLost, fail, width, unpack, numericDestination=null, MAX_BYTES, device: supplied=null}) {
   let device=supplied, gpuError=enabled?null:"GPU disabled by host option", lost=false;
   const pipelines=new Map(), residents=new Set();
   const watch=d=>d.lost.then(()=>{lost=true;gpuError="GPU device lost";onLost();});
@@ -384,7 +384,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
   }
   // One mapping for several ranges, through the session's reusable
   // readback buffer (grown on demand, released with the session).
-  async function staging(r, ranges) {
+  async function staging(r, ranges,consume=null) {
     const total=ranges.reduce((n,x)=>n+x[2],0);
     if(!total)return ranges.map(()=>new Uint32Array());
     if(!r.readback||r.readback.size<total) {
@@ -395,7 +395,11 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
     for(const [source,offset,bytes] of ranges){if(bytes)e.copyBufferToBuffer(source,offset,b,at,bytes);at+=bytes;}
     device.queue.submit([e.finish()]);
     await b.mapAsync(GPUMapMode.READ,0,total);
-    let all;try{all=new Uint32Array(b.getMappedRange(0,total),0,total/4).slice();}finally{b.unmap();}
+    let all;try{
+      const borrowed=new Uint32Array(b.getMappedRange(0,total),0,total/4);
+      if(consume){let start=0;return consume(ranges.map(x=>{const view=borrowed.subarray(start/4,(start+x[2])/4);start+=x[2];return view;}));}
+      all=borrowed.slice();
+    }finally{b.unmap();}
     at=0;return ranges.map(x=>{const w=all.subarray(at/4,(at+x[2])/4);at+=x[2];return w;});
   }
   function location(r, p, i) {
@@ -441,6 +445,20 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, MAX_BY
       const i=stepIndex(p,q?.step),l=location(r,p,i),list=l.type.kind==='list';
       const element=list?l.type.element:l.type,w=width(element);
       const header=words=>{const n=words[0];if(n>l.capacity)fail('GPU length exceeds capacity');return n;};
+      if(Object.hasOwn(q??{},'into')){
+        if(!numericDestination)fail('numeric destinations unavailable');
+        const target=numericDestination(l.type,q.into);
+        const put=(words,count)=>{if(count*w>target.length)fail('destination capacity');target.set(words.subarray(0,count*w));return count;};
+        if(r.mode==='steps'){
+          const bytes=(1+l.capacity*w)*4;
+          const count=await staging(r,[[l.buffer,0,bytes]],([words])=>put(words.subarray(1),header(words)));
+          return {count,counters:{readback_bytes:bytes}};
+        }
+        const count=l.header?header((await staging(r,[[l.buffer,0,4]]))[0]):1;
+        const bytes=count*w*4;
+        if(bytes)await staging(r,[[l.buffer,l.header?4:0,bytes]],([words])=>put(words,count));
+        return {count,counters:{readback_bytes:bytes+(l.header?4:0)}};
+      }
       if(q.length===true) {
         const n=l.header?header((await staging(r,[[l.buffer,0,4]]))[0]):1;
         return {length:n,counters:{readback_bytes:l.header?4:0}};

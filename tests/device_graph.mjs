@@ -18,7 +18,7 @@ globalThis.fetch=async url=>({async text(){return String(url).split('/').at(-1)}
 const list={kind:'list',element:{kind:'u32'}},word={kind:'u32'};
 const graph=(op,result,args,kind,indices)=>({nodes:[{id:0,op,args:args.map(param=>({param})),result,capacity:{kind,args:indices},shader:op,ordered:op!=='map',workgroup_size:op==='map'?64:1}],output:{node:0}});
 const functions=[{graph_required:true,graph:graph('filter',list,[0,1],'same',[0]),result:list},{shader:'direct-map',graph_required:false,graph:graph('map',list,[0],'same',[0]),result:list},{graph_required:true,graph:graph('sum',word,[0],'one',[]),result:word}];
-const engine=createDevice({root:new URL('http://mock/'),enabled:true,onLost(){},fail(s){throw Error(s)},width(t){return t.kind==='list'?this?.width?.(t.element)??1:1},unpack(w,t){return t.kind==='list'?[...w]:w[0]},MAX_BYTES:1024*1024});
+const engine=createDevice({root:new URL('http://mock/'),enabled:true,onLost(){},fail(s){throw Error(s)},numericDestination(t,d){if(t.kind!=='list'||!(d instanceof Uint32Array)||t.element.kind!=='u32')throw Error('dtype');return new Uint32Array(d.buffer,d.byteOffset,d.byteLength/4);},width(t){return t.kind==='list'?this?.width?.(t.element)??1:1},unpack(w,t){return t.kind==='list'?[...w]:w[0]},MAX_BYTES:1024*1024});
 function plan(input,iterations=1){return {inputs:new Map([['xs',{index:0}]]),feedback:new Map(),constants:[{words:Uint32Array.from(input),type:list,count:input.length},{words:Uint32Array.of(2),type:word,count:1}],steps:[{f:functions[0],args:[{kind:'constant',index:0,count:input.length},{kind:'constant',index:1,count:1}],count:input.length},{f:functions[1],args:[{kind:'step',index:0,count:input.length}],count:input.length},{f:functions[2],args:[{kind:'step',index:1,count:input.length}],count:1}],outputs:['result'],ids:new Map([['result',2]]),iterations,reason:null};}
 const p=plan([1,3,2,4],3);
 assert.deepEqual(engine.preparation(p),{device:false,shaders:[['filter',false],['map',false],['sum',false]]});
@@ -83,7 +83,7 @@ const shortSlice=await engine.read(sliceState,slicePlan,{step:'filtered',slice:[
 assert.deepEqual({value:shortSlice.value,length:shortSlice.length,start:shortSlice.start},{value:[],length:2,start:2});
 await assert.rejects(engine.advance(sliceState,overDispatch,1_000_000),/dispatch budget/);
 engine.closeSession(sliceState);
-engine.close();console.log('PASS prepared graph/legacy residency, input capture, no repeated allocations, logical extents, owned output, cleanup');console.log('PASS graph capacity, mixed dynamic lengths, iteration buffer reuse, exact counters, empty stages, input nonmutation, resident feedback, alias swaps, capacity and allocation guards');
+console.log('PASS prepared graph/legacy residency, input capture, no repeated allocations, logical extents, owned output, cleanup');console.log('PASS graph capacity, mixed dynamic lengths, iteration buffer reuse, exact counters, empty stages, input nonmutation, resident feedback, alias swaps, capacity and allocation guards');
 
 for(const value of [0,1,16,0xffffffff]) assert.deepEqual(graphCapacity({nodes:[{args:[],capacity:{kind:'fixed',value,args:[]}}],output:{node:0}},[]),{capacities:[value],outputCount:value});
 for(const value of [-1,0x100000000,NaN,Infinity,0.5,undefined]) assert.throws(()=>graphCapacity({nodes:[{args:[],capacity:{kind:'fixed',value,args:[]}}],output:{node:0}},[]),/capacity/);
@@ -91,3 +91,18 @@ for(const value of [-1,0x100000000,NaN,Infinity,0.5,undefined]) assert.throws(()
 for(const input of [0,2,4,9]) assert.deepEqual(graphCapacity({nodes:[{args:[{param:0}],capacity:{kind:'max',floor:4,args:[0]}}],output:{node:0}},[input]),{capacities:[Math.max(4,input)],outputCount:Math.max(4,input)});
 for(const floor of [-1,0x100000000,NaN,Infinity,0.5,null]) assert.throws(()=>graphCapacity({nodes:[{args:[{param:0}],capacity:{kind:'max',floor,args:[0]}}],output:{node:0}},[9]),/capacity/);
 assert.throws(()=>graphCapacity({nodes:[{args:[],capacity:{kind:'max',floor:4,args:[]}}],output:{node:0}},[]),/capacity/);
+
+// Direct numeric reads copy while mapped; poison-on-unmap must never leak.
+const numericPlan=plan([1,3,2,4]);numericPlan.ids.set('filtered',0);
+await engine.prepare(numericPlan);const numericSession=await engine.open(numericPlan);await engine.advance(numericSession,numericPlan,1);
+const destination=new Uint32Array([99,99,99,99]);
+const numeric=await engine.read(numericSession,numericPlan,{step:'filtered',into:destination});
+assert.equal(numeric.count,2);assert.deepEqual(Array.from(destination),[3,4,99,99]);
+const shortDestination=new Uint32Array([88]);await assert.rejects(engine.read(numericSession,numericPlan,{step:'filtered',into:shortDestination}),/capacity/);assert.equal(shortDestination[0],88);
+await assert.rejects(engine.read(numericSession,numericPlan,{step:'filtered',into:new Float32Array(4)}),/dtype/);
+await engine.advance(numericSession,numericPlan,1);assert.deepEqual(Array.from(destination),[3,4,99,99]);engine.closeSession(numericSession);assert.equal(live,0);
+legacy.constants[0].words.set([0,4294967295]);const numericLegacy=await engine.open(legacy);await engine.advance(numericLegacy,legacy,1);const legacyDestination=new Uint32Array([99,99,99]);
+assert.equal((await engine.read(numericLegacy,legacy,{step:'result',into:legacyDestination})).count,2);assert.deepEqual(Array.from(legacyDestination),[1,0,99]);engine.closeSession(numericLegacy);assert.equal(live,0);
+console.log('PASS numeric destination readback, mapped lifetime, graph/legacy lengths, dtype/capacity and tails');
+
+engine.close();
