@@ -430,14 +430,9 @@ else if(i<n1+n2){{let j=i-n1;for(var k=0u;k<{width}u;k++){{out[1u+i*{width}u+k]=
     }
 }
 
-/// Exact wrapping integer sum: grid-stride partials in at most 256 groups,
-/// then one group combines them. The scalar result has no header.
-pub(super) fn sum_list(tag: &str, kind: Kind, src: usize) -> Schedule {
-    let mut s = Schedule { passes: vec![], scratch: vec![] };
-    let l = kind.lanes();
-    let part = s.scratch(l, "r1", 1);
+fn tree(kind: Kind) -> String {
     let t = kind.ty();
-    let tree = format!(
+    format!(
         "var<workgroup> sh:array<{t},256>;
 fn tree(l:u32,v:{t})->{t}{{
 sh[l]=v;workgroupBarrier();
@@ -445,26 +440,12 @@ for(var s=128u;s>0u;s=s>>1u){{if(l<s){{sh[l]=kadd(sh[l],sh[l+s]);}}workgroupBarr
 return sh[0];
 }}
 "
-    );
-    s.passes.push(Pass {
-        name: format!("{tag}-sum0.wgsl"),
-        code: format!(
-            "{}{}{tree}{MAIN}{{
-let n=src[0];let total=nwg.x*256u;
-var acc=kzero();
-for(var e=wid.x*256u+lid.x;e<n;e+=total){{acc=kadd(acc,{});}}
-let r=tree(lid.x,acc);
-if(lid.x==0u){{{}if(wid.x==0u){{part[0]=nwg.x;}}}}
-}}
-",
-            decls(&[("src", false), ("part", true)]),
-            kind.ops(),
-            kind.load("src", &format!("1u+e*{l}u")),
-            kind.store("part", &format!("1u+wid.x*{l}u"), "r"),
-        ),
-        bind: vec![arg(src), scratch(part)],
-        groups: "r1",
-    });
+    )
+}
+/// The second pass of a sum: one group combines the partials.
+fn sum_partials(s: &mut Schedule, tag: &str, kind: Kind, part: usize) {
+    let l = kind.lanes();
+    let tree = tree(kind);
     s.passes.push(Pass {
         name: format!("{tag}-sum1.wgsl"),
         code: format!(
@@ -484,5 +465,69 @@ if(lid.x==0u){{{}}}
         bind: vec![scratch(part), out()],
         groups: "one",
     });
+}
+/// The exact wrapping integer sum of a value computed for each element of
+/// node input 0, as `sum_list` sums stored elements. `element` is WGSL for
+/// index `i` that runs `acc=kadd(acc,v);` when the element contributes; it
+/// may read node inputs `a0..` and `declarations`. Filters feeding a sum
+/// become branches here, so no filtered list is compacted or stored.
+pub(super) fn sum_mapped(tag: &str, kind: Kind, declarations: &str, inputs: usize, element: &str) -> Schedule {
+    let mut s = Schedule { passes: vec![], scratch: vec![] };
+    let l = kind.lanes();
+    let part = s.scratch(l, "r1", 1);
+    let mut bindings: String = (0..inputs)
+        .map(|i| format!("@group(0) @binding({i}) var<storage,read> a{i}:array<u32>;\n"))
+        .collect();
+    bindings.push_str(&format!("@group(0) @binding({inputs}) var<storage,read_write> part:array<u32>;\n"));
+    s.passes.push(Pass {
+        name: format!("{tag}-sum0.wgsl"),
+        code: format!(
+            "{declarations}{bindings}{}{}{MAIN}{{
+let n=a0[0];let total=nwg.x*256u;
+var acc=kzero();
+for(var e=wid.x*256u+lid.x;e<n;e+=total){{let i=e;
+{element}
+}}
+let r=tree(lid.x,acc);
+if(lid.x==0u){{{}if(wid.x==0u){{part[0]=nwg.x;}}}}
+}}
+",
+            kind.ops(),
+            tree(kind),
+            kind.store("part", &format!("1u+wid.x*{l}u"), "r"),
+        ),
+        bind: (0..inputs).map(arg).chain([scratch(part)]).collect(),
+        groups: "r1",
+    });
+    sum_partials(&mut s, tag, kind, part);
+    s
+}
+/// Exact wrapping integer sum: grid-stride partials in at most 256 groups,
+/// then one group combines them. The scalar result has no header.
+pub(super) fn sum_list(tag: &str, kind: Kind, src: usize) -> Schedule {
+    let mut s = Schedule { passes: vec![], scratch: vec![] };
+    let l = kind.lanes();
+    let part = s.scratch(l, "r1", 1);
+    let tree = tree(kind);
+    s.passes.push(Pass {
+        name: format!("{tag}-sum0.wgsl"),
+        code: format!(
+            "{}{}{tree}{MAIN}{{
+let n=src[0];let total=nwg.x*256u;
+var acc=kzero();
+for(var e=wid.x*256u+lid.x;e<n;e+=total){{acc=kadd(acc,{});}}
+let r=tree(lid.x,acc);
+if(lid.x==0u){{{}if(wid.x==0u){{part[0]=nwg.x;}}}}
+}}
+",
+            decls(&[("src", false), ("part", true)]),
+            kind.ops(),
+            kind.load("src", &format!("1u+e*{l}u")),
+            kind.store("part", &format!("1u+wid.x*{l}u"), "r"),
+        ),
+        bind: vec![arg(src), scratch(part)],
+        groups: "r1",
+    });
+    sum_partials(&mut s, tag, kind, part);
     s
 }

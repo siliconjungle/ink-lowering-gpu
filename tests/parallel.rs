@@ -107,3 +107,32 @@ fn browser_reduction_shaders_validate() {
         validate(&name, code.as_str().unwrap());
     }
 }
+#[test]
+fn filtered_integer_sums_are_one_reduction() {
+    // sum over map/filter stages is one two-pass reduction: no compaction
+    // schedule and no node per stage. Captured scalars are node inputs.
+    let e = emit(
+        "module F;\nrecord Item {price:u64,qty:u64,open:Bool,}\n\
+fn s32(xs:List<u32>,l:u32)->u32{return sum(xs.filter(fn(x)=>x<l).map(fn(x)=>x*17+3));}\n\
+fn s64(xs:List<u64>)->u64{return sum(xs.map(fn(x)=>x+1).filter(fn(x)=>x>3));}\n\
+fn rev(items:List<Item>)->u64{return sum(items.filter(fn(i)=>i.open).map(fn(i)=>i.price*i.qty));}\n\
+fn si(xs:List<i32>,k:i32)->i32{return sum(xs.filter(fn(x)=>x>k).filter(fn(x)=>x<100).map(fn(x)=>x*k));}\n\
+fn plain(xs:List<u32>)->u32{return sum(xs.map(fn(x)=>x+1));}\n",
+    );
+    for (name, inputs) in [("s32", 2), ("s64", 1), ("rev", 1), ("si", 2)] {
+        let f = function(&e, name);
+        let nodes = f["graph"]["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1, "{name}: {nodes:?}");
+        assert_eq!(nodes[0]["op"], "sum", "{name}");
+        assert_eq!(nodes[0]["args"].as_array().unwrap().len(), inputs, "{name}");
+        let passes = nodes[0]["schedule"]["passes"].as_array().unwrap();
+        assert_eq!(passes.len(), 2, "{name}");
+        assert_eq!(passes[0]["bind"].as_array().unwrap().len(), inputs + 1, "{name}");
+        for pass in passes {
+            let shader = pass["shader"].as_str().unwrap();
+            validate(shader, &e.shaders[shader]);
+        }
+    }
+    // Without a filter the map node and parallel sum are unchanged.
+    assert_eq!(function(&e, "plain")["graph"]["nodes"].as_array().unwrap().len(), 2);
+}

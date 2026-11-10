@@ -166,6 +166,11 @@ impl Graph<'_> {
                 }
                 return self.walk(&f.body, &local, Some(&f.result));
             }
+            if n == "sum" {
+                if let Some(fused) = self.fused_sum(&args[0], env, &ty)? {
+                    return Ok(fused);
+                }
+            }
             if ["sum", "count", "foldr", "foldl"].contains(&n.as_str()) {
                 let list_ty = if n == "sum" {
                     Some(Type::List(Box::new(ty.clone())))
@@ -326,6 +331,113 @@ impl Graph<'_> {
     /// and concatenation. Float scans and sums keep their ordered serial
     /// stage (source evaluation order is part of their meaning).
     #[allow(clippy::too_many_arguments)]
+    /// An integer sum over map/filter stages with at least one filter: one
+    /// parallel reduction whose first pass evaluates the stages for each
+    /// element and adds the elements every filter keeps, instead of a
+    /// compaction schedule per filter and a node per map. Integer sums wrap
+    /// exactly, so the result equals the ordered sum. Anything this cannot
+    /// emit keeps the staged graph.
+    fn fused_sum(&mut self, e: &Expr, env: &GraphEnv, ty: &Type) -> LangResult<Option<Ref>> {
+        use parallel::Kind;
+        let kind = match ty {
+            Type::U32 => Kind::U32,
+            Type::I32 => Kind::I32,
+            Type::U64 => Kind::U64,
+            _ => return Ok(None),
+        };
+        let types = Self::types(env);
+        let whole = Type::List(Box::new(ty.clone()));
+        let mut stages = vec![];
+        let mut source = e;
+        while let Expr::Method(xs, n, args) = source {
+            if !matches!(n.as_str(), "map" | "filter") || args.len() != 1 || !matches!(args[0], Expr::Lambda(..)) {
+                break;
+            }
+            let list = check::infer_context(source, &types, self.p, if std::ptr::eq(source, e) { Some(&whole) } else { None })?;
+            let input = check::infer_context(xs, &types, self.p, if n == "filter" { Some(&list) } else { None })?;
+            let (Type::List(out), Type::List(input)) = (list, input) else { return Ok(None) };
+            stages.push((n.as_str(), &args[0], *input, *out));
+            source = xs;
+        }
+        if !stages.iter().any(|(n, ..)| *n == "filter") {
+            return Ok(None);
+        }
+        stages.reverse();
+        let (nodes, shaders, remaining, depth, alias) =
+            (self.nodes.len(), self.shaders.clone(), self.remaining, self.depth, self.alias);
+        match self.fused_sum_node(source, env, &stages, ty, kind) {
+            Ok(r) => Ok(Some(r)),
+            Err(_) => {
+                self.nodes.truncate(nodes);
+                self.shaders = shaders;
+                (self.remaining, self.depth, self.alias) = (remaining, depth, alias);
+                Ok(None)
+            }
+        }
+    }
+    fn fused_sum_node(&mut self, source: &Expr, env: &GraphEnv, stages: &[(&str, &Expr, Type, Type)], ty: &Type, kind: parallel::Kind) -> LangResult<Ref> {
+        let src = self.walk(source, env, Some(&Type::List(Box::new(stages[0].2.clone()))))?;
+        if self.nodes.len() >= 64 {
+            return Err("literal graph stage budget exceeded".into());
+        }
+        let mut needed = std::collections::BTreeSet::new();
+        for (_, callback, ..) in stages {
+            free_vars(callback, &mut std::collections::BTreeSet::new(), &mut needed);
+        }
+        let mut refs = vec![src.clone()];
+        let mut bindings = Env::new();
+        for (name, r) in env {
+            if !needed.contains(name) {
+                continue;
+            }
+            let i = if let Some(i) = refs.iter().position(|v| v.id == r.id) {
+                i
+            } else {
+                refs.push(r.clone());
+                refs.len() - 1
+            };
+            let carrier = if matches!(r.ty, Type::List(_)) { i.to_string() } else { load(&r.ty, &format!("a{i}"), "0u", self.p)? };
+            bindings.insert(name.clone(), (carrier, r.ty.clone()));
+        }
+        let mut em = Emitter {
+            p: self.p,
+            lines: String::new(),
+            next: 0,
+            budget: 100000,
+            depth: 0,
+            views: vec![],
+            local_lists: BTreeMap::new(),
+            private: Default::default(),
+            buffers: BTreeMap::new(),
+        };
+        let mut value = load_list(&stages[0].2, "a0", "i", self.p)?;
+        let mut closing = String::new();
+        for (n, callback, input, out) in stages {
+            let Expr::Lambda(a, body) = callback else { return Err("stage needs lambda".into()) };
+            let mut scope = bindings.clone();
+            scope.insert(a.clone(), (value.clone(), input.clone()));
+            if *n == "map" {
+                let v = em.scalar(body, &scope, out)?;
+                value = em.bind(out, &v)?;
+            } else {
+                let keep = em.scalar(body, &scope, &Type::Bool)?;
+                em.line(format!("if({keep}){{"));
+                closing.push('}');
+            }
+        }
+        let contribution = if *ty == Type::U64 { format!("vec2<u32>(({value}).lo,({value}).hi)") } else { value };
+        em.line(format!("acc=kadd(acc,{contribution});{closing}"));
+        let id = self.nodes.len();
+        let tag = format!("graph-{}-{id}", self.index);
+        let schedule = parallel::sum_mapped(&tag, kind, self.declarations, refs.len(), &em.lines);
+        for pass in &schedule.passes {
+            self.shaders.insert(pass.name.clone(), pass.code.clone());
+        }
+        let mut node = json!({"id":id,"op":"sum","args":refs.iter().map(|r|r.id.clone()).collect::<Vec<_>>(),"arg_types":refs.iter().map(|r|desc(&r.ty,self.p)).collect::<LangResult<Vec<_>>>()?,"result":desc(ty,self.p)?,"capacity":{"kind":"one","args":[]},"shader":Value::Null,"workgroup_size":256,"ordered":false,"parallel":true});
+        node["schedule"] = schedule.descriptor();
+        self.nodes.push(node);
+        Ok(Ref { id: json!({"node": id}), ty: ty.clone() })
+    }
     fn parallel(
         &mut self,
         op: &str,
