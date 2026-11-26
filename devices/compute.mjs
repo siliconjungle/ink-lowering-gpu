@@ -535,6 +535,27 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
       return {counters:{upload_bytes:words.byteLength}};
     });
   }
+  // The host has checked each range against the current logical length.
+  // Only payload words change. The length header remains resident.
+  async function writeRanges(r, p, input, ranges) {
+    live(r);
+    const reference = p.inputs.get(input);
+    if (!reference || reference.type.kind !== 'list' || p.feedback.has(input)) {
+      fail('range writes require an independent List input');
+    }
+    const target = r.mode === 'steps'
+      ? r.input[reference.index]
+      : r.constants[reference.index].buffer;
+    return scoped(() => {
+      let bytes = 0;
+      for (const { wordOffset, words } of ranges) {
+        if (!words.length) continue;
+        device.queue.writeBuffer(target, (1 + wordOffset) * 4, words);
+        bytes += words.byteLength;
+      }
+      return {counters: {upload_bytes: bytes}};
+    });
+  }
   // Snapshot a completed logical List value into another resident session's
   // input. The header and bounded payload stay on the device. Queue ordering
   // makes later source writes/steps/close independent of the copied value.
@@ -609,7 +630,7 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
     const ready=!!device&&!lost&&!gpuError;
     return {device:ready,shaders:[...new Set(names)].sort().map(name=>[name,ready&&pipelines.has(name)])};
   }
-  return {prepare,preparation,run,capture,open,advance,read,write,copyFrom,view,finish,close:closeAll,
+  return {prepare,preparation,run,capture,open,advance,read,write,writeRanges,copyFrom,view,finish,close:closeAll,
     closeSession:close,handle:()=>device,
   };
   function closeAll(){for(const r of [...residents])close(r);if(!supplied)device?.destroy();lost=true;gpuError="engine disposed";pipelines.clear();}

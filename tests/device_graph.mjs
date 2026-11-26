@@ -16,6 +16,9 @@ const device={limits:{maxStorageBuffersPerShaderStage:8,maxComputeWorkgroupsPerD
 Object.defineProperty(globalThis,'navigator',{value:{gpu:{async requestAdapter(){return {async requestDevice(){return device}}}}}});
 globalThis.fetch=async url=>({async text(){return String(url).split('/').at(-1)}});
 const list={kind:'list',element:{kind:'u32'}},word={kind:'u32'};
+device.queue.writeBuffer = (buffer, offset, words) => {
+  new Uint32Array(buffer.data, offset, words.length).set(words);
+};
 const graph=(op,result,args,kind,indices)=>({nodes:[{id:0,op,args:args.map(param=>({param})),result,capacity:{kind,args:indices},shader:op,ordered:op!=='map',workgroup_size:op==='map'?64:1}],output:{node:0}});
 const functions=[{graph_required:true,graph:graph('filter',list,[0,1],'same',[0]),result:list},{shader:'direct-map',graph_required:false,graph:graph('map',list,[0],'same',[0]),result:list},{graph_required:true,graph:graph('sum',word,[0],'one',[]),result:word}];
 const packedWidth=t=>t.kind==='list'?packedWidth(t.element):t.kind==='vector'?t.size*packedWidth(t.element):t.kind==='record'?t.fields.reduce((n,f)=>n+packedWidth(f.type),0):1;
@@ -31,6 +34,19 @@ assert.equal(engine.preparation(p).shaders[0][1],true);
 const result=await engine.run(p);
 assert.equal(result.values.result,9);assert.equal(result.counters.dispatches,9);assert.equal(dispatches,9);assert.equal(result.counters.upload_bytes,24);assert.equal(result.counters.readback_bytes,4);assert.equal(result.counters.live_buffer_bytes,peak);assert.equal(allocations,6);assert.equal(live,0);assert.deepEqual([...p.constants[0].words],[1,3,2,4]);
 const empty=plan([]);await engine.prepare(empty);assert.equal((await engine.run(empty)).values.result,0);assert.equal(live,0);
+const patched = plan([1, 3, 2, 4]);
+patched.inputs.set('xs', {index: 0, type: list, count: 4});
+const patchedResident = await engine.open(patched);
+const liveBefore = live;
+assert.equal((await engine.writeRanges(patchedResident, patched, 'xs', [
+  {wordOffset: 0, words: Uint32Array.of(6)},
+  {wordOffset: 3, words: Uint32Array.of(12)},
+])).counters.upload_bytes, 8);
+assert.equal(live, liveBefore);
+await engine.advance(patchedResident, patched, 1);
+assert.deepEqual((await engine.read(patchedResident, patched, {outputs: ['result']})).values, {result: 24});
+engine.closeSession(patchedResident);
+assert.equal(live, 0);
 for(const input of [[1,3,2,4],[0,1],[]]) {
   const feedback=plan(input,3);feedback.feedback.set('xs',1);
   await engine.prepare(feedback);const actual=await engine.run(feedback);

@@ -224,6 +224,35 @@ impl Gpu {
     pub(super) fn write(&self, r: &mut Resident, p: &Plan, input: &str, d: &Data) -> Result<Value> {
         self.scoped(|| self.write_inner(r, p, input, d))
     }
+    /// The host has checked all ranges against the current logical length.
+    /// Leave the header intact and upload only overwritten payload words.
+    pub(super) fn write_ranges(
+        &self,
+        resident: &Resident,
+        plan: &Plan,
+        input: &str,
+        ranges: &[(usize, Data)],
+    ) -> Result<Value> {
+        let reference = plan.inputs.get(input).ok_or("unknown pipeline input")?;
+        if reference.ty["kind"] != "list" || plan.feedback.contains_key(input) {
+            return Err("range writes require an independent List input".into());
+        }
+        let target = match resident {
+            Resident::Steps(state) => &state.input[reference.index],
+            Resident::Graph(state) => &state.constants[reference.index].buffer,
+        };
+        self.scoped(|| {
+            let mut upload = 0;
+            for (offset, data) in ranges {
+                if !data.words.is_empty() {
+                    let bytes = bytes_of(&data.words);
+                    self.queue.write_buffer(target, ((offset + 1) * 4) as u64, bytes);
+                    upload += bytes.len();
+                }
+            }
+            Ok(json!({"counters": {"upload_bytes": upload}}))
+        })
+    }
     /// The device buffer currently holding a step's value, for a renderer or
     /// another pipeline on the same device. Valid until the next advance,
     /// write or close of this session.
