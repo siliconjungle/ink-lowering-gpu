@@ -34,6 +34,7 @@ fn parallel_stages_carry_complete_schedules() {
         assert_eq!(node["parallel"], true, "{name}");
         assert!(node["shader"].is_null(), "{name}");
         let schedule = &node["schedule"];
+        assert_eq!(schedule["initializes_workgroup_memory"], true, "{name}");
         let passes = schedule["passes"].as_array().unwrap();
         assert!(passes[0]["shader"].as_str().unwrap().ends_with(&format!("{first}.wgsl")), "{name}");
         let scratch = schedule["scratch"].as_array().unwrap().len() as u64;

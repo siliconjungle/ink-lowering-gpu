@@ -82,6 +82,9 @@ impl Schedule {
         json!({
             "passes": self.passes.iter().map(|p| json!({"shader": p.name, "bind": p.bind, "groups": p.groups})).collect::<Vec<_>>(),
             "scratch": self.scratch,
+            // Scheduled kernels write every workgroup location they read,
+            // with barriers between producers and consumers.
+            "initializes_workgroup_memory": true,
         })
     }
 }

@@ -1402,7 +1402,8 @@ impl Gpu {
                         let name = pass["shader"].as_str().ok_or("missing pass shader")?;
                         if !self.pipelines.contains_key(name) {
                             let readonly = bind.iter().map(|b| b.get("arg").is_some()).collect::<Vec<_>>();
-                            let pipe = self.compile(name, &readonly)?;
+                            let initializes_workgroup_memory = n["schedule"]["initializes_workgroup_memory"] == true;
+                            let pipe = self.compile_schedule_pass(name, &readonly, initializes_workgroup_memory)?;
                             self.pipelines.insert(name.into(), pipe);
                         }
                     }
@@ -1529,7 +1530,12 @@ fn scratch_words(spec: &Value, extent: usize) -> Result<usize> {
 }
 impl Gpu {
     /// Compile a bundled shader whose bindings are read-only where marked.
-    fn compile(&self, name: &str, readonly: &[bool]) -> Result<wgpu::ComputePipeline> {
+    fn compile_schedule_pass(
+        &self,
+        name: &str,
+        readonly: &[bool],
+        initializes_workgroup_memory: bool,
+    ) -> Result<wgpu::ComputePipeline> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let code = assets::SHADERS
@@ -1569,7 +1575,10 @@ impl Gpu {
             layout: Some(&layout),
             module: &module,
             entry_point: Some("main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: !initializes_workgroup_memory,
+                ..Default::default()
+            },
             cache: None,
         });
         let allocation = pollster::block_on(oom.pop());
