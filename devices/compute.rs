@@ -215,7 +215,13 @@ impl Gpu {
     }
     /// Run more iterations on resident buffers. Nothing is read back.
     pub(super) fn advance(&self, r: &mut Resident, p: &Plan, iterations: u64) -> Result<Value> {
-        self.scoped(|| self.advance_inner(r, p, iterations))
+        let result = self.scoped(|| self.advance_inner(r, p, iterations));
+        if let (Err(_), Resident::Graph(graph)) = (&result, r) {
+            if let Some(retained) = &mut graph.retained {
+                retained.refresh = true;
+            }
+        }
+        result
     }
     /// Block until all submitted work has finished (for measurement).
     pub(super) fn finish(&self) -> Result<()> {
@@ -258,6 +264,9 @@ impl Gpu {
                     self.queue.write_buffer(target, ((offset + 1) * 4) as u64, bytes);
                     upload += bytes.len();
                 }
+            }
+            if let (true, Resident::Graph(graph)) = (upload != 0, resident) {
+                graph.invalidate_input(reference.index);
             }
             Ok(json!({"counters": {"upload_bytes": upload}}))
         })
@@ -441,8 +450,25 @@ impl Gpu {
                             f.skip = false;
                         }
                     }
-                    for (name, group, groups) in &r.dispatches {
-                        chunk.dispatch(&self.pipelines[name], group, *groups as u32);
+                    let mut encode = |range: std::ops::Range<usize>| {
+                        for (name, group, groups) in &r.dispatches[range] {
+                            chunk.dispatch(&self.pipelines[name], group, *groups as u32);
+                        }
+                    };
+                    if let Some(retained) = &mut r.retained {
+                        for step in &retained.steps {
+                            if retained.refresh || step.dependencies.as_ref().is_none_or(|inputs| {
+                                inputs.iter().any(|&i| retained.dirty_inputs[i].load(Ordering::Relaxed))
+                            }) {
+                                encode(step.dispatches.clone());
+                            }
+                        }
+                        retained.refresh = false;
+                        for input in &mut retained.dirty_inputs {
+                            *input.get_mut() = false;
+                        }
+                    } else {
+                        encode(0..r.dispatches.len());
                     }
                     r.iteration += 1;
                     r.owed = !r.pending.is_empty();
@@ -785,6 +811,7 @@ impl Gpu {
                     }
                     _ => {
                         self.queue.write_buffer(&target.buffer, 0, bytes_of(&words));
+                        r.invalidate_input(reference.index);
                         for f in &mut r.pending {
                             if f.input == input {
                                 f.skip = true;
@@ -842,7 +869,14 @@ impl Gpu {
             .collect::<Result<Vec<_>>>()?;
         let mut values: Vec<GraphData> = Vec::new();
         let mut dispatches = Vec::new();
-        for s in &p.steps {
+        let mut step_dependencies: Vec<Vec<usize>> = Vec::new();
+        let mut retained = (p.retained_steps != 0).then(|| RetainedGraph {
+            steps: Vec::new(),
+            dirty_inputs: (0..constants.len()).map(|_| AtomicBool::new(false)).collect(),
+            refresh: true,
+        });
+        for (index, s) in p.steps.iter().enumerate() {
+            let start = dispatches.len();
             let args = s
                 .args
                 .iter()
@@ -956,6 +990,23 @@ impl Gpu {
                 });
             }
             values.push(graph_ref(&g["output"], &args, &nodes)?);
+            if let Some(retained) = &mut retained {
+                let mut dependencies = std::collections::BTreeSet::new();
+                for arg in &s.args {
+                    if arg.step {
+                        dependencies.extend(step_dependencies[arg.index].iter().copied());
+                    } else {
+                        dependencies.insert(arg.index);
+                    }
+                }
+                let inputs: Vec<_> = dependencies.into_iter().collect();
+                retained.steps.push(RetainedStep {
+                    dispatches: start..dispatches.len(),
+                    dependencies: (p.retained_steps & (1u64 << index) != 0)
+                        .then(|| inputs.clone().into_boxed_slice()),
+                });
+                step_dependencies.push(inputs);
+            }
         }
         // Logical lengths travel with each list header; capacities stay bounded.
         let pending = p
@@ -984,6 +1035,7 @@ impl Gpu {
             constants,
             values,
             dispatches,
+            retained,
             pending,
             iteration: 0,
             owed: false,
@@ -1065,11 +1117,28 @@ pub(super) struct GraphResident {
     constants: Vec<GraphData>,
     values: Vec<GraphData>,
     dispatches: Vec<(String, wgpu::BindGroup, usize)>,
+    retained: Option<RetainedGraph>,
     pending: Vec<Feedback>,
     iteration: u64,
     owed: bool,
     live: usize,
     upload: usize,
+}
+impl GraphResident {
+    fn invalidate_input(&self, index: usize) {
+        if let Some(retained) = &self.retained {
+            retained.dirty_inputs[index].store(true, Ordering::Relaxed);
+        }
+    }
+}
+struct RetainedGraph {
+    steps: Vec<RetainedStep>,
+    dirty_inputs: Vec<AtomicBool>,
+    refresh: bool,
+}
+struct RetainedStep {
+    dispatches: std::ops::Range<usize>,
+    dependencies: Option<Box<[usize]>>,
 }
 struct Feedback {
     input: String,
