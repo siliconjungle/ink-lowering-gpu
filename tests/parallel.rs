@@ -70,6 +70,13 @@ fn parallel_stages_carry_complete_schedules() {
     };
     assert_eq!(digits("sort_u32"), 4);
     assert_eq!(digits("sort_u64"), 8);
+    let merge = &function(&e, "sort_u64")["graph"]["nodes"][0]["merge_schedule"];
+    let passes = merge["passes"].as_array().unwrap();
+    assert_eq!(passes.len(), 18);
+    assert_eq!(passes[1]["min_extent"], 257);
+    assert_eq!(passes[16]["min_extent"], 8_388_609);
+    assert_eq!(passes[17]["min_extent"], 257);
+    assert!(function(&e, "sort_i32")["graph"]["nodes"][0]["merge_schedule"].is_null());
     // Float sums keep their sequential source order (no reduction tree).
     let f = emit("module Floats;\nfn total(xs: List<f32>) -> f32 { return sum(xs); }");
     let total = function(&f, "total");

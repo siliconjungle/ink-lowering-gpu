@@ -445,6 +445,116 @@ for(var k=0u;k<{l}u;k++){{sortdst[{to_off}u+d*{l}u+k]=sortsrc[{from_off}u+i*{l}u
     s
 }
 
+/// Alternate exact sort for native hosts that have measured a benefit.
+/// Sort 256-key tiles, then merge pairs of increasing width. A lower bound
+/// for a left key and upper bound for a right key give every input its own
+/// destination, including duplicate keys across tiles.
+pub(super) fn merge_sort_u64(tag: &str, src: usize) -> (Schedule, Value) {
+    let mut s = Schedule { passes: vec![], scratch: vec![] };
+    let temp = s.scratch(2, "c", 0);
+    let less = "fn less(a:vec2<u32>,b:vec2<u32>)->bool{return a.y<b.y||(a.y==b.y&&a.x<b.x);}\n";
+    s.passes.push(Pass {
+        name: format!("{tag}-tiles.wgsl"),
+        code: format!(
+            "{}{less}{WORKGROUP_COUNT}
+var<workgroup> a:array<vec2<u32>,256>;
+var<workgroup> b:array<vec2<u32>,256>;
+{MAIN}{{
+ let lane=lid.x;let i=wid.x*256u+lane;
+ if(lane==0u){{group_count=src[0];}}
+ let n=workgroupUniformLoad(&group_count);
+ if(i==0u){{out[0]=n;}}
+ if(wid.x>=(n+255u)/256u){{return;}}
+ // A partial tile is padded with the largest u64, indistinguishable from
+ // an actual largest key once only the first n values are written.
+ var key=vec2<u32>(0xffffffffu);
+ if(i<n){{key=vec2<u32>(src[1u+i*2u],src[2u+i*2u]);}}
+ a[lane]=key;workgroupBarrier();
+ var use_a=true;
+ for(var size=2u;size<=256u;size<<=1u){{
+  for(var stride=size>>1u;stride>0u;stride>>=1u){{
+   let peer=lane^stride;
+   let low=((lane&stride)==0u)==((lane&size)==0u);
+   if(use_a){{
+    let x=a[lane];let y=a[peer];
+    b[lane]=select(x,y,select(less(x,y),less(y,x),low));
+   }}else{{
+    let x=b[lane];let y=b[peer];
+    a[lane]=select(x,y,select(less(x,y),less(y,x),low));
+   }}
+   workgroupBarrier();use_a=!use_a;
+  }}
+ }}
+ // The tile has 36 stages, so the last writes are to a.
+ if(i<n){{let key=a[lane];out[1u+i*2u]=key.x;out[2u+i*2u]=key.y;}}
+}}
+",
+            decls(&[("src", false), ("out", true)])
+        ),
+        bind: vec![arg(src), out()],
+        groups: "b1",
+    });
+    // Sixteen merges cover the existing 256^3 schedule bound.
+    let widths = (0..16).map(|level| 256usize << level);
+    for (level, width) in widths.clone().enumerate() {
+        let (from, from_offset, to, to_offset) = if level % 2 == 0 {
+            (out(), 1, scratch(temp), 0)
+        } else {
+            (scratch(temp), 0, out(), 1)
+        };
+        let from_high = from_offset + 1;
+        let to_high = to_offset + 1;
+        let pair_width = width * 2;
+        s.passes.push(Pass {
+            name: format!("{tag}-merge{level}.wgsl"),
+            code: format!(
+                "{}{less}
+fn key_at(i:u32)->vec2<u32>{{return vec2<u32>(src[{from_offset}u+i*2u],src[{from_high}u+i*2u]);}}
+{MAIN}{{
+ let n=cnt[0];let i=wid.x*256u+lid.x;
+ if(n<={width}u||i>=n){{return;}}
+ let block=i/{pair_width}u*{pair_width}u;
+ let middle=min(block+{width}u,n);let end=min(block+{pair_width}u,n);
+ let left=i<middle;let key=key_at(i);
+ let other=select(block,middle,left);
+ var lo=other;var hi=select(middle,end,left);
+ while lo<hi {{
+  let mid=(lo+hi)/2u;let peer=key_at(mid);
+  if(select(!less(key,peer),less(peer,key),left)){{lo=mid+1u;}}else{{hi=mid;}}
+ }}
+ let d=block+(i-select(middle,block,left))+(lo-other);
+ dst[{to_offset}u+d*2u]=key.x;dst[{to_high}u+d*2u]=key.y;
+}}
+",
+                decls(&[("cnt", false), ("src", true), ("dst", true)])
+            ),
+            bind: vec![arg(src), from, to],
+            groups: "b1",
+        });
+    }
+    s.passes.push(Pass {
+        name: format!("{tag}-publish.wgsl"),
+        code: format!(
+            "{}{MAIN}{{
+ let n=cnt[0];let i=wid.x*256u+lid.x;
+ if(n<=256u||i>=n){{return;}}
+ let levels=32u-countLeadingZeros(n-1u)-8u;
+ if((levels&1u)!=0u){{out[1u+i*2u]=tmp[i*2u];out[2u+i*2u]=tmp[1u+i*2u];}}
+}}
+",
+            decls(&[("cnt", false), ("tmp", true), ("out", true)])
+        ),
+        bind: vec![arg(src), scratch(temp), out()],
+        groups: "b1",
+    });
+    let mut descriptor = s.descriptor();
+    for (index, width) in widths.enumerate() {
+        descriptor["passes"][index + 1]["min_extent"] = json!(width + 1);
+    }
+    descriptor["passes"][17]["min_extent"] = json!(257);
+    (s, descriptor)
+}
+
 /// Parallel concatenation of two lists of `width`-lane elements.
 pub(super) fn concat_lists(tag: &str, a: usize, b: usize, width: usize) -> Schedule {
     Schedule {

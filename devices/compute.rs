@@ -8,6 +8,7 @@ pub(super) struct Gpu {
     /// Runtime-generated kernels (reductions), keyed by shader name.
     extra: std::sync::Mutex<BTreeMap<String, wgpu::ComputePipeline>>,
     lost: Arc<AtomicBool>,
+    pub(super) merge_sort_u64: bool,
 }
 impl Gpu {
     pub(super) fn new() -> Result<Self> {
@@ -44,6 +45,14 @@ impl Gpu {
             pipelines: BTreeMap::new(),
             extra: std::sync::Mutex::new(BTreeMap::new()),
             lost,
+            merge_sort_u64: false,
+        }
+    }
+    fn schedule<'a>(&self, node: &'a Value) -> &'a Value {
+        if self.merge_sort_u64 && node["merge_schedule"].is_object() {
+            &node["merge_schedule"]
+        } else {
+            &node["schedule"]
         }
     }
     pub(super) fn prepare(&mut self, p: &Plan) -> Result<()> {
@@ -867,15 +876,16 @@ impl Gpu {
                     .iter()
                     .map(|r| graph_ref(r, &args, &nodes))
                     .collect::<Result<Vec<_>>>()?;
-                if n["schedule"].is_object() {
+                let schedule = self.schedule(n);
+                if schedule.is_object() {
                     let extent = inputs.iter().map(|a| a.capacity).fold(count, usize::max);
-                    let scratch = n["schedule"]["scratch"]
+                    let scratch = schedule["scratch"]
                         .as_array()
                         .ok_or("invalid schedule scratch")?
                         .iter()
                         .map(|w| make(scratch_words(w, extent)? * 4, U::STORAGE, None))
                         .collect::<Result<Vec<_>>>()?;
-                    for pass in n["schedule"]["passes"].as_array().ok_or("invalid schedule")? {
+                    for pass in scheduled_passes(schedule, extent)? {
                         let name = pass["shader"].as_str().ok_or("missing pass shader")?;
                         let pipe = self.pipelines.get(name).ok_or("unprepared pass shader")?;
                         let entries = pass["bind"]
@@ -1385,12 +1395,13 @@ impl Gpu {
                 .iter()
                 .enumerate()
             {
-                if n["schedule"].is_object() {
+                let schedule = self.schedule(n);
+                if schedule.is_object() {
                     let extent = schedule_extent(n, &counts, &caps, i)?;
                     if extent > PARALLEL_MAX {
                         return Err("GPU parallel stage capacity exceeds 256^3".into());
                     }
-                    for pass in n["schedule"]["passes"].as_array().ok_or("invalid schedule")? {
+                    for pass in scheduled_passes(schedule, extent)? {
                         let bind = pass["bind"].as_array().ok_or("invalid schedule bindings")?;
                         if bind.len() > limits.max_storage_buffers_per_shader_stage as usize {
                             return Err("GPU graph binding limits".into());
@@ -1402,7 +1413,7 @@ impl Gpu {
                         let name = pass["shader"].as_str().ok_or("missing pass shader")?;
                         if !self.pipelines.contains_key(name) {
                             let readonly = bind.iter().map(|b| b.get("arg").is_some()).collect::<Vec<_>>();
-                            let initializes_workgroup_memory = n["schedule"]["initializes_workgroup_memory"] == true;
+                            let initializes_workgroup_memory = schedule["initializes_workgroup_memory"] == true;
                             let pipe = self.compile_schedule_pass(name, &readonly, initializes_workgroup_memory)?;
                             self.pipelines.insert(name.into(), pipe);
                         }
@@ -1527,6 +1538,10 @@ fn scratch_words(spec: &Value, extent: usize) -> Result<usize> {
         .and_then(|n| n.checked_add(extra))
         .map(|n| n.max(1))
         .ok_or("scratch size overflow".into())
+}
+fn scheduled_passes(schedule: &Value, extent: usize) -> Result<impl Iterator<Item = &Value>> {
+    let passes = schedule["passes"].as_array().ok_or("invalid schedule")?;
+    Ok(passes.iter().filter(move |pass| pass["min_extent"].as_u64().unwrap_or(0) <= extent as u64))
 }
 impl Gpu {
     /// Compile a bundled shader whose bindings are read-only where marked.

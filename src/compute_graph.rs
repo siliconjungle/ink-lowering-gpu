@@ -502,6 +502,13 @@ impl Graph<'_> {
         };
         let mut node = json!({"id":id,"op":op,"args":refs.iter().map(|r|r.id.clone()).collect::<Vec<_>>(),"arg_types":refs.iter().map(|r|desc(&r.ty,self.p)).collect::<LangResult<Vec<_>>>()?,"result":desc(ty,self.p)?,"capacity":capacity,"shader":Value::Null,"workgroup_size":256,"ordered":false,"parallel":true});
         node["schedule"] = schedule.descriptor();
+        if op == "sort" && kind == Some(Kind::U64) {
+            let (merge, descriptor) = parallel::merge_sort_u64(&format!("{tag}-native"), slots[0]);
+            for pass in merge.passes {
+                self.shaders.insert(pass.name, pass.code);
+            }
+            node["merge_schedule"] = descriptor;
+        }
         self.nodes.push(node);
         Ok(Some(Ref {
             id: json!({"node":id}),
