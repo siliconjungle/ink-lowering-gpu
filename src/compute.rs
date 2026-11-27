@@ -270,6 +270,31 @@ impl Emitter<'_> {
         self.depth -= 1;
         result
     }
+
+    fn scalar_bindings(&mut self, mut e: &Expr, env: &Env, t: &Type) -> LangResult<String> {
+        // A let initializer is nested, but its tail is the next statement at
+        // the same WGSL depth. Keep charging each statement to the node budget.
+        let mut local = env.clone();
+        while let Expr::Let(name, annotation, value, body) = e {
+            let ty = check::infer_context(value, &Self::types(&local), self.p, annotation.as_deref())?;
+            let bound = if matches!(ty, Type::List(_)) {
+                self.list(value, &local, Some(&ty))?
+            } else {
+                let value = self.scalar(value, &local, &ty)?;
+                self.bind(&ty, &value)?
+            };
+            local.insert(name.clone(), (bound, ty));
+            e = body;
+            if matches!(e, Expr::Let(..)) {
+                if self.budget == 0 {
+                    return Err("compute expression budget exceeded".into());
+                }
+                self.budget -= 1;
+            }
+        }
+        self.scalar_inner(e, &local, t)
+    }
+
     fn scalar_inner(&mut self, e: &Expr, env: &Env, t: &Type) -> LangResult<String> {
         if self.budget == 0 {
             return Err("compute expression budget exceeded".into());
@@ -312,22 +337,7 @@ impl Emitter<'_> {
                     format!("(-({a}))")
                 })
             }
-            Expr::Let(n, annotation, x, b) => {
-                let xt = check::infer_context(x, &Self::types(env), self.p, annotation.as_deref())?;
-                let a = if matches!(xt, Type::List(_)) {
-                    self.list(x, env, Some(&xt))?
-                } else {
-                    self.scalar(x, env, &xt)?
-                };
-                let v = if matches!(xt, Type::List(_)) {
-                    a
-                } else {
-                    self.bind(&xt, &a)?
-                };
-                let mut local = env.clone();
-                local.insert(n.clone(), (v, xt));
-                self.scalar(b, &local, t)
-            }
+            Expr::Let(..) => self.scalar_bindings(e, env, t),
             Expr::Field(x, n) => {
                 let xt = check::infer(x, &Self::types(env), self.p)?;
                 let a = self.scalar(x, env, &xt)?;

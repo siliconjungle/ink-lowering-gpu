@@ -86,3 +86,34 @@ fn transitive_collections_keep_eager_stages_and_lazy_scalar_control() {
     let module=naga::front::wgsl::parse_str(code).unwrap();
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(),naga::valid::Capabilities::empty()).validate(&module).unwrap();
 }
+
+#[test]
+fn sequential_scalar_bindings_keep_a_gpu_map_eligible() {
+    use std::fmt::Write;
+
+    let mut source = String::from("module SequentialBindings; fn initial(x:f32)->f32{return x;}");
+    let mut previous = "initial".to_string();
+    // Each helper is shallow enough for the executable core. Inlining them
+    // must preserve the depth of their sequential statements.
+    for layer in 0..3 {
+        let name = format!("adjust{layer}");
+        write!(source, "fn {name}(x:f32)->f32{{let y0=x;").unwrap();
+        for index in 1..=20 {
+            write!(source, "let y{index}=y{}+1.0;", index - 1).unwrap();
+        }
+        write!(source, "return {previous}(y20);}}").unwrap();
+        previous = name;
+    }
+    write!(source, "fn mapped(xs:List<f32>)->List<f32>{{return xs.map(fn(x)=>{previous}(x));}}").unwrap();
+    let bundle = emission(&source);
+    let mapped = function(&bundle, "mapped");
+    assert!(mapped["fallback_reason"].is_null(), "{}", mapped["fallback_reason"]);
+    assert!(mapped["graph"].is_object() || mapped["shader"].is_string());
+    for shader in bundle.shaders.values() {
+        let module = naga::front::wgsl::parse_str(shader).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        ).validate(&module).unwrap();
+    }
+}
