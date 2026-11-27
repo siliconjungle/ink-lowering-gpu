@@ -1,4 +1,4 @@
-// Binary32 evaluated with integer lanes: round-to-nearest, ties-to-even,
+// Binary32 carried in integer lanes: round-to-nearest, ties-to-even,
 // gradual underflow, signed zero and canonical arithmetic NaN.
 fn ink_f32_nan(x:u32)->bool{return (x&0x7fffffffu)>0x7f800000u;}
 fn ink_f32_eq(a:u32,b:u32)->bool{return !ink_f32_nan(a)&&!ink_f32_nan(b)&&(a==b||((a|b)&0x7fffffffu)==0u);}
@@ -45,13 +45,49 @@ fn ink_f32_mul(a:u32,b:u32)->u32{
  let shift=select(20u,21u,high);let extended=(product.lo>>shift)|(product.hi<<(32u-shift))|select(0u,1u,(product.lo&((1u<<shift)-1u))!=0u);
  return ink_f32_round(sign,ea+eb-127i+select(0i,1i,high),extended);
 }
-// Exact sqrt and division use integer significands, independent of WGSL float
-// approximation allowances and device flush-to-zero behavior.
+// A native operation can propose a normal result. Accept it only when the
+// exact integer-scaled input lies between the candidate's rounding midpoints.
+fn ink_f32_in_rounding_interval(value:InkU64,low:InkU64,high:InkU64,sig:u32)->bool{
+ let even=(sig&1u)==0u;
+ return (ink_u64_lt(low,value)||(even&&ink_u64_eq(low,value)))
+     && (ink_u64_lt(value,high)||(even&&ink_u64_eq(value,high)));
+}
+fn ink_f32_exact_sqrt_candidate(x:u32,raw:u32,candidate:u32)->bool{
+ // At an exact power of two, the predecessor has a different ULP.
+ let fraction=candidate&0x7fffffu;
+ if(candidate<0x800000u||candidate>=0x7f800000u||fraction==0u){return false;}
+ let shift=i32(raw)-2i*i32(candidate>>23u)+152i;
+ if(shift<25i||shift>26i){return false;}
+ let s=u32(shift);let input=(x&0x7fffffu)|0x800000u;
+ let scaled=InkU64(input<<s,input>>(32u-s));
+ let sig=fraction|0x800000u;
+ // sqrt(input) is between the midpoints iff input is between their squares.
+ let lo=InkU64(sig*2u-1u,0u);let hi=InkU64(sig*2u+1u,0u);
+ return ink_f32_in_rounding_interval(scaled,ink_u64_mul(lo,lo),ink_u64_mul(hi,hi),sig);
+}
+fn ink_f32_exact_div_candidate(a:u32,b:u32,exponent_diff:i32,candidate:u32)->bool{
+ let fraction=candidate&0x7fffffu;
+ if(candidate<0x800000u||candidate>=0x7f800000u||fraction==0u){return false;}
+ let shift=exponent_diff-i32(candidate>>23u)+151i;
+ if(shift<24i||shift>25i){return false;}
+ let s=u32(shift);let input=(a&0x7fffffu)|0x800000u;
+ let scaled=InkU64(input<<s,input>>(32u-s));
+ let sig=fraction|0x800000u;
+ let divisor=InkU64((b&0x7fffffu)|0x800000u,0u);
+ // Compare input against each midpoint times the positive divisor.
+ return ink_f32_in_rounding_interval(scaled,ink_u64_mul(InkU64(sig*2u-1u,0u),divisor),
+     ink_u64_mul(InkU64(sig*2u+1u,0u),divisor),sig);
+}
 fn ink_f32_sqrt(x:u32)->u32{
  let a=x&0x7fffffffu;if(a==0u){return x;}
  if(a>0x7f800000u||(x&0x80000000u)!=0u){return 0x7fc00000u;}
  if(a==0x7f800000u){return x;}
- let raw=(x>>23u)&255u;var m=(x&0x7fffffu)|select(0u,0x800000u,raw!=0u);var e=i32(max(raw,1u))-127i;
+ let raw=x>>23u;
+ if(raw!=0u){
+  let candidate=bitcast<u32>(sqrt(bitcast<f32>(x)));
+  if(ink_f32_exact_sqrt_candidate(x,raw,candidate)){return candidate;}
+ }
+ var m=(x&0x7fffffu)|select(0u,0x800000u,raw!=0u);var e=i32(max(raw,1u))-127i;
  loop{if(m>=0x800000u){break;}m<<=1u;e--;}
  let odd=e&1i;var half=(e-odd)/2i;let shift=23u+u32(odd);
  let n=InkU64(m<<shift,m>>(32u-shift));var lo=0u;var hi=0x1000000u;
@@ -66,13 +102,24 @@ fn ink_f32_div(a:u32,b:u32)->u32{
  if(ink_f32_nan(a)||ink_f32_nan(b)||(aa==0u&&bb==0u)||(aa==0x7f800000u&&bb==aa)){return 0x7fc00000u;}
  if(aa==0x7f800000u||bb==0u){return sign|0x7f800000u;}
  if(aa==0u||bb==0x7f800000u){return sign;}
- let ra=(a>>23u)&255u;let rb=(b>>23u)&255u;var ea=i32(max(ra,1u))-127i;var eb=i32(max(rb,1u))-127i;
+ let ra=aa>>23u;let rb=bb>>23u;let exponent_diff=i32(ra)-i32(rb);
+ if(ra!=0u&&rb!=0u&&bb<=0x7e800000u&&abs(exponent_diff)<=124i){
+  let candidate=bitcast<u32>(bitcast<f32>(aa)/bitcast<f32>(bb));
+  if(ink_f32_exact_div_candidate(aa,bb,exponent_diff,candidate)){return sign|candidate;}
+ }
+ var ea=i32(max(ra,1u))-127i;var eb=i32(max(rb,1u))-127i;
  var sa=(a&0x7fffffu)|select(0u,0x800000u,ra!=0u);var sb=(b&0x7fffffu)|select(0u,0x800000u,rb!=0u);
  loop{if(sa>=0x800000u){break;}sa<<=1u;ea--;}
  loop{if(sb>=0x800000u){break;}sb<<=1u;eb--;}
  var e=ea-eb;if(sa<sb){sa<<=1u;e--;}
- let division=ink_u64_div(InkU64(sa<<26u,sa>>6u),InkU64(sb,0u));
- let extended=division.quotient.lo|select(0u,1u,!ink_u64_eq(division.remainder,InkU64(0u,0u)));
+ // The normalized ratio is in [1,2). Generate its fractional bits with
+ // a remainder smaller than the 24-bit divisor, so one u32 lane suffices.
+ var remainder=sa-sb;var quotient=1u;
+ for(var i=0u;i<26u;i++){
+  remainder<<=1u;quotient<<=1u;
+  if(remainder>=sb){remainder-=sb;quotient|=1u;}
+ }
+ let extended=quotient|select(0u,1u,remainder!=0u);
  return ink_f32_round(sign,e+127i,extended);
 }
 // mode: 0 trunc, 1 floor, 2 ceil, 3 ties-to-even.

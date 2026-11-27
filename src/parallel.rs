@@ -111,15 +111,31 @@ const MAIN: &str = "@compute @workgroup_size(256) fn main(@builtin(local_invocat
 fn block_scan(kind: Kind) -> String {
     let t = kind.ty();
     format!(
-        "var<workgroup> sh:array<{t},256>;
+        "var<workgroup> scan_a:array<{t},256>;
+var<workgroup> scan_b:array<{t},256>;
 fn block_scan(l:u32,v:{t})->{t}{{
-sh[l]=v;workgroupBarrier();
-for(var off=1u;off<256u;off=off<<1u){{var x=sh[l];if(l>=off){{x=kadd(sh[l-off],x);}}workgroupBarrier();sh[l]=x;workgroupBarrier();}}
-return sh[l];
+scan_a[l]=v;
+workgroupBarrier();
+for(var off=1u;off<256u;off=off<<2u){{
+var a=scan_a[l];
+if(l>=off){{a=kadd(scan_a[l-off],a);}}
+scan_b[l]=a;
+workgroupBarrier();
+let stride=off*2u;
+var b=scan_b[l];
+if(l>=stride){{b=kadd(scan_b[l-stride],b);}}
+scan_a[l]=b;
+workgroupBarrier();
+}}
+return scan_a[l];
 }}
 "
     )
 }
+
+// Share the header once so WGSL can prove that a whole workgroup returns
+// together before a scan or sort uses barriers.
+const WORKGROUP_COUNT: &str = "var<workgroup> group_count:u32;\n";
 
 /// Where a scanned array lives: a buffer name in the pass, its first word,
 /// and whether the pass that seeds it copies from a separate source.
@@ -163,9 +179,11 @@ fn scan(s: &mut Schedule, tag: &str, kind: Kind, t: ScanTarget) {
     s.passes.push(Pass {
         name: format!("{tag}-scan0.wgsl"),
         code: format!(
-            "{}{common}{MAIN}{{
-let n={count};let i=wid.x*256u+lid.x;
+            "{}{common}{WORKGROUP_COUNT}{MAIN}{{
+if(lid.x==0u){{group_count={count};}}
+let n=workgroupUniformLoad(&group_count);let i=wid.x*256u+lid.x;
 {}
+if(wid.x>=(n+255u)/256u){{return;}}
 var v=kzero();if(i<n){{v={};}}
 let r=block_scan(lid.x,v);
 if(i<n){{{}}}
@@ -185,8 +203,10 @@ if(lid.x==255u){{{}}}
     s.passes.push(Pass {
         name: format!("{tag}-scan1.wgsl"),
         code: format!(
-            "{}{common}{MAIN}{{
-let n={count};let m=(n+255u)/256u;let i=wid.x*256u+lid.x;
+            "{}{common}{WORKGROUP_COUNT}{MAIN}{{
+if(lid.x==0u){{group_count={count};}}
+let n=workgroupUniformLoad(&group_count);let m=(n+255u)/256u;let i=wid.x*256u+lid.x;
+if(wid.x>=(m+255u)/256u){{return;}}
 var v=kzero();if(i<m){{v={};}}
 let r=block_scan(lid.x,v);
 if(i<m){{{}}}
@@ -355,14 +375,16 @@ if(i<n){{for(var k=0u;k<{l}u;k++){{out[1u+i*{l}u+k]=src[1u+i*{l}u+k];}}}}
         s.passes.push(Pass {
             name: format!("{tag}-hist{d}.wgsl"),
             code: format!(
-                "{}var<workgroup> counts:array<atomic<u32>,256>;
+                "{}{WORKGROUP_COUNT}var<workgroup> counts:array<atomic<u32>,256>;
 {MAIN}{{
-let n=cnt[0];let nb=(n+255u)/256u;let i=wid.x*256u+lid.x;
+if(lid.x==0u){{group_count=cnt[0];}}
+let n=workgroupUniformLoad(&group_count);let nb=(n+255u)/256u;let i=wid.x*256u+lid.x;
+if(wid.x>=nb){{return;}}
 atomicStore(&counts[lid.x],0u);
 workgroupBarrier();
 if(i<n){{atomicAdd(&counts[{digit}],1u);}}
 workgroupBarrier();
-if(wid.x<nb){{hist[lid.x*nb+wid.x]=atomicLoad(&counts[lid.x]);}}
+hist[lid.x*nb+wid.x]=atomicLoad(&counts[lid.x]);
 }}
 ",
                 decls(&[("cnt", false), ("sortsrc", true), ("hist", true)])
@@ -382,18 +404,30 @@ if(wid.x<nb){{hist[lid.x*nb+wid.x]=atomicLoad(&counts[lid.x]);}}
                 header: false,
             },
         );
+        // Each bucket records one bit per lane. Counting the full bucket and
+        // the bits before this lane gives a stable rank without scanning keys.
         s.passes.push(Pass {
             name: format!("{tag}-place{d}.wgsl"),
             code: format!(
-                "{}var<workgroup> keys:array<u32,256>;
+                "{}{WORKGROUP_COUNT}var<workgroup> members:array<atomic<u32>,2048>;
 {MAIN}{{
-let n=cnt[0];let nb=(n+255u)/256u;let i=wid.x*256u+lid.x;
-var mine=256u;if(i<n){{mine={digit};}}
-keys[lid.x]=mine;
+if(lid.x==0u){{group_count=cnt[0];}}
+let n=workgroupUniformLoad(&group_count);let nb=(n+255u)/256u;let i=wid.x*256u+lid.x;
+if(wid.x>=nb){{return;}}
+for(var k=lid.x;k<2048u;k+=256u){{atomicStore(&members[k],0u);}}
+workgroupBarrier();
+let own=lid.x/32u;let bit=1u<<(lid.x%32u);
+var mine=0u;
+if(i<n){{mine={digit};atomicOr(&members[mine*8u+own],bit);}}
 workgroupBarrier();
 if(i<n){{
 var rank=0u;var total=0u;
-for(var j=0u;j<256u;j++){{if(keys[j]==mine){{total++;if(j<lid.x){{rank++;}}}}}}
+for(var j=0u;j<8u;j++){{
+let bits=atomicLoad(&members[mine*8u+j]);
+let prefix=select(0u,0xffffffffu,j<own)|select(0u,bit-1u,j==own);
+total+=countOneBits(bits);
+rank+=countOneBits(bits&prefix);
+}}
 let d=hist[mine*nb+wid.x]-total+rank;
 for(var k=0u;k<{l}u;k++){{sortdst[{to_off}u+d*{l}u+k]=sortsrc[{from_off}u+i*{l}u+k];}}
 }}
