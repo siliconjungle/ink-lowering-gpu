@@ -192,7 +192,7 @@ impl Gpu {
     pub(super) fn execute(&self, p: &Plan) -> Result<Value> {
         self.scoped(|| {
             let mut r = self.open_inner(p)?;
-            let advanced = self.advance_inner(&mut r, p, p.iterations as u64)?;
+            let advanced = self.advance_inner(&mut r, p, p.iterations as u64, None)?;
             let (values, readback, peak) = self.read_outputs_inner(&r, p, &p.outputs)?;
             let mut counters = json!({
                 "upload_bytes": r.upload(),
@@ -214,9 +214,24 @@ impl Gpu {
         self.scoped(|| self.open_inner(p))
     }
     /// Run more iterations on resident buffers. Nothing is read back.
-    pub(super) fn advance(&self, r: &mut Resident, p: &Plan, iterations: u64) -> Result<Value> {
-        let result = self.scoped(|| self.advance_inner(r, p, iterations));
+    pub(super) fn advance(
+        &self, r: &mut Resident, p: &Plan, iterations: u64,
+        encode: Option<&mut dyn FnMut(&mut wgpu::CommandEncoder)>,
+    ) -> Result<Value> {
+        let original_iteration = if encode.is_some() {
+            match r {
+                Resident::Graph(graph) if iterations == 1 && p.feedback.is_empty()
+                    && graph.dispatches.len() < CHUNK_PASSES => Some(graph.iteration),
+                _ => return Err("co-encoding requires one bounded step of a feedback-free GPU graph".into()),
+            }
+        } else {
+            None
+        };
+        let result = self.scoped(|| self.advance_inner(r, p, iterations, encode));
         if let (Err(_), Resident::Graph(graph)) = (&result, r) {
+            if let Some(iteration) = original_iteration {
+                graph.iteration = iteration;
+            }
             if let Some(retained) = &mut graph.retained {
                 retained.refresh = true;
             }
@@ -401,7 +416,10 @@ impl Gpu {
             upload,
         }))
     }
-    fn advance_inner(&self, r: &mut Resident, p: &Plan, iterations: u64) -> Result<Value> {
+    fn advance_inner(
+        &self, r: &mut Resident, p: &Plan, iterations: u64,
+        encode: Option<&mut dyn FnMut(&mut wgpu::CommandEncoder)>,
+    ) -> Result<Value> {
         if iterations.saturating_mul(dispatch_count(p) as u64) > 64 * 1024 * 1024 {
             return Err("GPU dispatch budget exceeded".into());
         }
@@ -474,6 +492,9 @@ impl Gpu {
                     r.owed = !r.pending.is_empty();
                 }
             }
+        }
+        if let Some(encode) = encode {
+            encode(chunk.encoder());
         }
         let dispatches = chunk.finish();
         Ok(json!({"iteration": r.iteration(), "dispatches": dispatches, "resident_copy_bytes": copies}))

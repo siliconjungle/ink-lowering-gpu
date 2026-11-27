@@ -167,7 +167,7 @@ if(wid.x==0u){if(mode==1u){out[0]=n;}else{out[0]=data[0];}}
 // One device for every pipeline, session and caller-supplied renderer. A
 // session uploads its inputs once, keeps every value resident across calls,
 // and reads back only what is asked for.
-export function createDevice({root, enabled, onLost, fail, width, unpack, numericDestination=null, MAX_BYTES, device: supplied=null}) {
+export function createDevice({root, enabled, onLost, fail, width, unpack, numericDestination=null, MAX_BYTES, device: supplied=null, parallelU64Merge=false}) {
   let device=supplied, gpuError=enabled?null:"GPU disabled by host option", lost=false;
   const pipelines=new Map(), residents=new Set();
   const watch=d=>d.lost.then(()=>{lost=true;gpuError="GPU device lost";onLost();});
@@ -211,6 +211,8 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
     pipelines.set(name,pipe);
     return pipe;
   }
+  const schedule = node => parallelU64Merge && node.merge_schedule ? node.merge_schedule : node.schedule;
+  const passes = (selected, extent) => selected.passes.filter(pass => (pass.min_extent ?? 0) <= extent);
   async function prepare(p) {
     if(p.reason)fail(p.reason);
     if(p.iterations*dispatchCount(p)>MAX_DISPATCHES)fail('GPU dispatch budget exceeded');
@@ -225,10 +227,11 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
         if(!s.f.graph)fail('mixed GPU graph requires a graph descriptor for every function');
         const counts=s.args.map(a=>a.count),cap=graphCapacity(s.f.graph,counts);
         for(const [i,n] of s.f.graph.nodes.entries()) {
-          if(n.schedule) {
+          const selected=schedule(n);
+          if(selected) {
             const extent=scheduleExtent(n,counts,cap.capacities,i);
             if(extent>PARALLEL_MAX)fail('GPU parallel stage capacity exceeds 256^3');
-            for(const pass of n.schedule.passes) {
+            for(const pass of passes(selected,extent)) {
               if(pass.bind.length>limits.maxStorageBuffersPerShaderStage)fail('GPU graph binding limits');
               if(quantity(pass.groups,extent)>limits.maxComputeWorkgroupsPerDimension)fail('GPU graph workgroup limits');
               await compile(pass.shader,pass.bind.map(b=>Object.hasOwn(b,'arg')));
@@ -310,10 +313,11 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
         const count=cap.capacities[i],list=n.result.kind==='list';
         const buffer=A.make((count*width(n.result)+(list?1:0))*4,u.STORAGE|u.COPY_SRC|u.COPY_DST|u.VERTEX);
         const inputs=n.args.map(resolve);
-        if(n.schedule) {
+        const selected=schedule(n);
+        if(selected) {
           const extent=inputs.reduce((e,a)=>Math.max(e,a.capacity),count);
-          const scratch=n.schedule.scratch.map(w=>A.make(scratchWords(w,extent)*4,u.STORAGE));
-          for(const pass of n.schedule.passes) {
+          const scratch=selected.scratch.map(w=>A.make(scratchWords(w,extent)*4,u.STORAGE));
+          for(const pass of passes(selected,extent)) {
             const pipe=pipelines.get(pass.shader);if(!pipe)fail('unprepared pass shader');
             const entries=pass.bind.map((b,binding)=>{
               const target=Object.hasOwn(b,'arg')?inputs[b.arg]?.buffer:Object.hasOwn(b,'scratch')?scratch[b.scratch]:buffer;
@@ -345,10 +349,12 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
   // Run more iterations on resident buffers. Nothing is read back. Each
   // dispatch is its own synchronisation scope, so one compute pass carries
   // many dispatches; feedback copies end the pass.
-  async function advance(r, p, iterations) {
+  async function advance(r, p, iterations, encode=null) {
     live(r);
+    if(encode!==null&&(iterations!==1||r.mode!=='graph'||p.feedback.size||r.dispatches.length>=CHUNK_PASSES))fail('co-encoding requires one bounded step of a feedback-free GPU graph');
     if(iterations*dispatchCount(p)>MAX_DISPATCHES)fail('GPU dispatch budget exceeded');
-    return scoped(()=>{
+    const originalIteration=r.iteration;
+    const result=scoped(()=>{
       let encoder=null,pass=null,passes=0,dispatches=0,copies=0;
       const end=()=>{if(pass){pass.end();pass=null;}};
       const flush=()=>{end();if(encoder){device.queue.submit([encoder.finish()]);encoder=null;}passes=0;};
@@ -378,9 +384,15 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
           r.iteration++;r.owed=r.pending.length>0;
         }
       }
+      if(encode!==null) {
+        end();
+        if(encode(enc())?.then)fail('render encoder callback must be synchronous');
+      }
       flush();
       return {iteration:r.iteration,dispatches,resident_copy_bytes:copies};
     });
+    if(encode===null)return result;
+    return result.catch(error=>{r.iteration=originalIteration;throw error;});
   }
   // One mapping for several ranges, through the session's reusable
   // readback buffer (grown on demand, released with the session).
@@ -626,7 +638,19 @@ export function createDevice({root, enabled, onLost, fail, width, unpack, numeri
   // Read-only cost context. A prepared device does not imply that this plan's
   // shaders have been compiled, and partial preparation can survive a failure.
   function preparation(p){
-    const names=isGraph(p)?p.steps.flatMap(s=>(s.f.graph?.nodes??[]).flatMap(n=>n.schedule?n.schedule.passes.map(pass=>pass.shader):[n.shader])):p.steps.map(s=>s.f.shader);
+    const names=isGraph(p)?p.steps.flatMap(s=>{
+      const graph=s.f.graph;
+      if(!graph)return [];
+      const counts=s.args.map(arg=>arg.count);
+      let capacities;
+      try{({capacities}=graphCapacity(graph,counts));}catch{
+        return graph.nodes.flatMap(node=>schedule(node)?.passes.map(pass=>pass.shader)??[node.shader]);
+      }
+      return graph.nodes.flatMap((node,i)=>{
+        const selected=schedule(node);
+        return selected?passes(selected,scheduleExtent(node,counts,capacities,i)).map(pass=>pass.shader):[node.shader];
+      });
+    }):p.steps.map(s=>s.f.shader);
     const ready=!!device&&!lost&&!gpuError;
     return {device:ready,shaders:[...new Set(names)].sort().map(name=>[name,ready&&pipelines.has(name)])};
   }

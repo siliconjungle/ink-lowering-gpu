@@ -154,10 +154,12 @@ struct ScanTarget<'a> {
     count: (Value, &'a str),
     /// Write `n` into word 0 of the target.
     header: bool,
+    /// Fold the two prefix additions into the downstream consumer when false.
+    finish_prefix: bool,
 }
 /// Five passes: block scans at three levels (the top level is one group,
 /// so capacity is bounded by 256^3) and two passes adding block prefixes.
-fn scan(s: &mut Schedule, tag: &str, kind: Kind, t: ScanTarget) {
+fn scan(s: &mut Schedule, tag: &str, kind: Kind, t: ScanTarget) -> (usize, usize) {
     let l = kind.lanes();
     let s1 = s.scratch(l, "b1", 0);
     let s2 = s.scratch(l, "b2", 0);
@@ -242,6 +244,9 @@ if(i<m){{{}}}
         bind: vec![cnt_ref.clone(), scratch(s2)],
         groups: "one",
     });
+    if !t.finish_prefix {
+        return (s1, s2);
+    }
     // Q1, Q0: add each block's exclusive prefix.
     s.passes.push(Pass {
         name: format!("{tag}-scan3.wgsl"),
@@ -277,6 +282,7 @@ if(i<n&&wid.x>0u){{let v=kadd({},{});{}}}
         bind: vec![cnt_ref, t.target, scratch(s1)],
         groups: "b1",
     });
+    (s1, s2)
 }
 
 /// Inclusive wrapping prefix sum of an integer list (node input `src`).
@@ -292,21 +298,23 @@ pub(super) fn scan_list(tag: &str, kind: Kind, src: usize) -> Schedule {
             source: Some((arg(src), 1)),
             count: (arg(src), "cnt[0]"),
             header: true,
+            finish_prefix: true,
         },
     );
     s
 }
 
 /// Stable filter: flags from the predicate shader (written by the caller's
-/// first pass), an in-place scan of the flags, then a scatter of kept
-/// elements. `width` is the element width in lanes.
+/// first pass), three levels of tile-local scans, then a scatter of kept
+/// elements using their tile prefixes directly. `width` is the element
+/// width in lanes.
 pub(super) fn filter_list(tag: &str, predicate: Pass, src: usize, width: usize) -> Schedule {
     let mut s = Schedule { passes: vec![], scratch: vec![] };
     let flags = s.scratch(1, "c", 0);
     let mut predicate = predicate;
     predicate.bind.push(scratch(flags));
     s.passes.push(predicate);
-    scan(
+    let (blocks, groups) = scan(
         &mut s,
         tag,
         Kind::U32,
@@ -316,6 +324,7 @@ pub(super) fn filter_list(tag: &str, predicate: Pass, src: usize, width: usize) 
             source: None,
             count: (arg(src), "cnt[0]"),
             header: false,
+            finish_prefix: false,
         },
     );
     s.passes.push(Pass {
@@ -323,19 +332,22 @@ pub(super) fn filter_list(tag: &str, predicate: Pass, src: usize, width: usize) 
         code: format!(
             "{}{MAIN}{{
 let n=src[0];let i=wid.x*256u+lid.x;
-if(i==0u){{if(n==0u){{out[0]=0u;}}else{{out[0]=flags[n-1u];}}}}
-if(i<n){{
-let before=select(0u,flags[i-1u],i>0u);
-if(flags[i]!=before){{
-let d=flags[i]-1u;
+if(i>=n){{if(i==0u){{out[0]=0u;}}return;}}
+let rank=flags[i];var before=0u;
+if(lid.x!=0u){{before=flags[i-1u];}}
+let group=wid.x/256u;var prefix=0u;
+if(wid.x%256u!=0u){{prefix=blocks[wid.x-1u];}}
+if(group!=0u){{prefix+=groups[group-1u];}}
+if(i+1u==n){{out[0]=prefix+rank;}}
+if(rank!=before){{
+let d=prefix+rank-1u;
 for(var k=0u;k<{width}u;k++){{out[1u+d*{width}u+k]=src[1u+i*{width}u+k];}}
 }}
 }}
-}}
 ",
-            decls(&[("src", false), ("flags", true), ("out", true)]),
+            decls(&[("src", false), ("flags", true), ("blocks", true), ("groups", true), ("out", true)]),
         ),
-        bind: vec![arg(src), scratch(flags), out()],
+        bind: vec![arg(src), scratch(flags), scratch(blocks), scratch(groups), out()],
         groups: "b1",
     });
     s
@@ -405,6 +417,7 @@ hist[lid.x*nb+wid.x]=atomicLoad(&counts[lid.x]);
                 source: None,
                 count: (arg(src), "256u*((cnt[0]+255u)/256u)"),
                 header: false,
+                finish_prefix: true,
             },
         );
         // Each bucket records one bit per lane. Counting the full bucket and
@@ -457,36 +470,40 @@ pub(super) fn merge_sort_u64(tag: &str, src: usize) -> (Schedule, Value) {
         name: format!("{tag}-tiles.wgsl"),
         code: format!(
             "{}{less}{WORKGROUP_COUNT}
-var<workgroup> a:array<vec2<u32>,256>;
-var<workgroup> b:array<vec2<u32>,256>;
-{MAIN}{{
- let lane=lid.x;let i=wid.x*256u+lane;
+var<workgroup> tile:array<vec2<u32>,256>;
+fn padded(n:u32,i:u32)->vec2<u32>{{
+ if(i>=n){{return vec2<u32>(0xffffffffu);}}
+ return vec2<u32>(src[1u+i*2u],src[2u+i*2u]);
+}}
+fn publish(n:u32,i:u32,key:vec2<u32>){{
+ if(i<n){{out[1u+i*2u]=key.x;out[2u+i*2u]=key.y;}}
+}}
+@compute @workgroup_size(128)
+fn main(@builtin(local_invocation_index) lane:u32,@builtin(workgroup_id) wid:vec3<u32>){{
+ let base=wid.x*256u;
  if(lane==0u){{group_count=src[0];}}
  let n=workgroupUniformLoad(&group_count);
- if(i==0u){{out[0]=n;}}
- if(wid.x>=(n+255u)/256u){{return;}}
- // A partial tile is padded with the largest u64, indistinguishable from
- // an actual largest key once only the first n values are written.
- var key=vec2<u32>(0xffffffffu);
- if(i<n){{key=vec2<u32>(src[1u+i*2u],src[2u+i*2u]);}}
- a[lane]=key;workgroupBarrier();
- var use_a=true;
- for(var size=2u;size<=256u;size<<=1u){{
-  for(var stride=size>>1u;stride>0u;stride>>=1u){{
-   let peer=lane^stride;
-   let low=((lane&stride)==0u)==((lane&size)==0u);
-   if(use_a){{
-    let x=a[lane];let y=a[peer];
-    b[lane]=select(x,y,select(less(x,y),less(y,x),low));
-   }}else{{
-    let x=b[lane];let y=b[peer];
-    a[lane]=select(x,y,select(less(x,y),less(y,x),low));
+ if(base==0u&&lane==0u){{out[0]=n;}}
+ if(base>=n){{return;}}
+ // Every pair is disjoint within a stage, so one lane can swap both
+ // values in place. Pad the final tile with the largest possible key.
+ tile[lane]=padded(n,base+lane);
+ tile[lane+128u]=padded(n,base+lane+128u);
+ workgroupBarrier();
+ for(var span=2u;span<=256u;span<<=1u){{
+  for(var stride=span>>1u;stride>0u;stride>>=1u){{
+   let lo=lane/stride*(2u*stride)+lane%stride;
+   let hi=lo+stride;
+   let x=tile[lo];let y=tile[hi];
+   if(select(less(x,y),less(y,x),(lo&span)==0u)){{
+    tile[lo]=y;
+    tile[hi]=x;
    }}
-   workgroupBarrier();use_a=!use_a;
+   workgroupBarrier();
   }}
  }}
- // The tile has 36 stages, so the last writes are to a.
- if(i<n){{let key=a[lane];out[1u+i*2u]=key.x;out[2u+i*2u]=key.y;}}
+ publish(n,base+lane,tile[lane]);
+ publish(n,base+lane+128u,tile[lane+128u]);
 }}
 ",
             decls(&[("src", false), ("out", true)])

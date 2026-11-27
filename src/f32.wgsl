@@ -54,10 +54,15 @@ fn ink_f32_mul(a:u32,b:u32)->u32{
 // exact integer-scaled input lies between the candidate's rounding midpoints.
 // Zero accepts the candidate; -1 or +1 points to its adjacent lane.
 // The candidate checks return 2 when their midpoint scaling is inapplicable.
-fn ink_f32_rounding_direction(value:InkU64,low:InkU64,high:InkU64,sig:u32)->i32{
- let even=(sig&1u)==0u;
- if(ink_u64_lt(value,low)||(!even&&ink_u64_eq(value,low))){return -1i;}
- if(ink_u64_lt(high,value)||(!even&&ink_u64_eq(value,high))){return 1i;}
+fn ink_f32_rounding_direction(value:InkU64,center:InkU64,down:u32,up:u32,sig:u32)->i32{
+ let below=ink_u64_lt(value,center);
+ var distance:InkU64;
+ if(below){distance=ink_u64_sub(center,value);}
+ else{distance=ink_u64_sub(value,center);}
+ let limit=select(up,down,below);
+ if(distance.hi!=0u||distance.lo>limit||(distance.lo==limit&&(sig&1u)!=0u)){
+  return select(1i,-1i,below);
+ }
  return 0i;
 }
 fn ink_f32_sqrt_candidate_direction(x:u32,raw:u32,candidate:u32)->i32{
@@ -70,8 +75,9 @@ fn ink_f32_sqrt_candidate_direction(x:u32,raw:u32,candidate:u32)->i32{
  let scaled=InkU64(input<<s,input>>(32u-s));
  let sig=fraction|0x800000u;
  // sqrt(input) is between the midpoints iff input is between their squares.
- let lo=InkU64(sig*2u-1u,0u);let hi=InkU64(sig*2u+1u,0u);
- return ink_f32_rounding_direction(scaled,ink_u64_mul(lo,lo),ink_u64_mul(hi,hi),sig);
+ let twice=InkU64(sig*2u,0u);
+ // (2s +/- 1)^2 differs from (2s)^2 by +/- 4s plus one.
+ return ink_f32_rounding_direction(scaled,ink_u64_mul(twice,twice),sig*4u-1u,sig*4u+1u,sig);
 }
 fn ink_f32_div_candidate_direction(a:u32,b:u32,exponent_diff:i32,candidate:u32)->i32{
  let fraction=candidate&0x7fffffu;
@@ -83,8 +89,8 @@ fn ink_f32_div_candidate_direction(a:u32,b:u32,exponent_diff:i32,candidate:u32)-
  let sig=fraction|0x800000u;
  let divisor=InkU64((b&0x7fffffu)|0x800000u,0u);
  // Compare input against each midpoint times the positive divisor.
- return ink_f32_rounding_direction(scaled,ink_u64_mul(InkU64(sig*2u-1u,0u),divisor),
-     ink_u64_mul(InkU64(sig*2u+1u,0u),divisor),sig);
+ return ink_f32_rounding_direction(scaled,ink_u64_mul(InkU64(sig*2u,0u),divisor),
+     divisor.lo,divisor.lo,sig);
 }
 fn ink_f32_sqrt(x:u32)->u32{
  let a=x&0x7fffffffu;if(a==0u){return x;}
